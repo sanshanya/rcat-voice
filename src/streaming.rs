@@ -125,6 +125,36 @@ impl StreamControl {
     }
 }
 
+/// Stream cancellation handle that does not keep the delta input channel open.
+#[derive(Clone)]
+pub struct StreamCancelHandle {
+    cancel_tx: watch::Sender<bool>,
+    pause_tx: watch::Sender<bool>,
+    tts_engine: Arc<dyn TtsEngine>,
+    llm_start: Arc<OnceLock<Instant>>,
+}
+
+impl StreamCancelHandle {
+    /// 标记 LLM 请求开始时间，用于指标统计。
+    pub fn mark_llm_start(&self) {
+        let _ = self.llm_start.get_or_init(Instant::now);
+    }
+
+    /// 中断播放并清空已排队音频（不可恢复）。
+    pub async fn pause(&self) -> Result<()> {
+        let _ = self.pause_tx.send(true);
+        self.tts_engine.stop().await?;
+        Ok(())
+    }
+
+    /// 取消当前流并停止播放。
+    pub async fn cancel(&self) -> Result<()> {
+        let _ = self.cancel_tx.send(true);
+        self.tts_engine.stop().await?;
+        Ok(())
+    }
+}
+
 /// 将 LLM 流式增量接入分段器与播放管线的会话。
 pub struct StreamSession {
     control: StreamControl,
@@ -220,6 +250,15 @@ impl StreamSession {
 
     pub fn control(&self) -> StreamControl {
         self.control.clone()
+    }
+
+    pub fn cancel_handle(&self) -> StreamCancelHandle {
+        StreamCancelHandle {
+            cancel_tx: self.control.cancel_tx.clone(),
+            pause_tx: self.control.pause_tx.clone(),
+            tts_engine: self.control.tts_engine.clone(),
+            llm_start: self.control.llm_start.clone(),
+        }
     }
 
     /// 终止会话并等待后台任务结束。

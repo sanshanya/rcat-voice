@@ -90,13 +90,19 @@ impl Pipeline {
             Arc::new(StdMutex::new(None));
         let mut second_gen_logged = false;
         let mut play_done_tasks: JoinSet<()> = JoinSet::new();
+        let mut cancel_closed = false;
+        let mut pause_closed = false;
 
         loop {
             if *self.cancel_rx.borrow() {
                 break;
             }
             let maybe_segment = tokio::select! {
-                _ = self.pause_rx.changed() => {
+                res = self.pause_rx.changed(), if !pause_closed => {
+                    if res.is_err() {
+                        pause_closed = true;
+                        None
+                    } else {
                     if *self.pause_rx.borrow() {
                         let _ = self.engine.stop().await;
                         while self.chunk_rx.try_recv().is_ok() {}
@@ -109,8 +115,14 @@ impl Pipeline {
                         }
                     }
                     None
+                    }
                 }
-                _ = self.cancel_rx.changed() => None,
+                res = self.cancel_rx.changed(), if !cancel_closed => {
+                    if res.is_err() {
+                        cancel_closed = true;
+                    }
+                    None
+                },
                 maybe = self.chunk_rx.recv() => maybe,
             };
             let Some(segment) = maybe_segment else {
@@ -151,6 +163,8 @@ impl Pipeline {
             Arc::new(StdMutex::new(None));
         let mut second_gen_logged = false;
         let mut play_done_tasks: JoinSet<()> = JoinSet::new();
+        let mut cancel_closed = false;
+        let mut pause_closed = false;
 
         let (synth_tx, mut synth_rx) = mpsc::channel::<SynthOutcome>(128);
         let max_inflight = self.config.synth_inflight;
@@ -168,7 +182,11 @@ impl Pipeline {
             }
 
             tokio::select! {
-                _ = self.pause_rx.changed() => {
+                res = self.pause_rx.changed(), if !pause_closed => {
+                    if res.is_err() {
+                        pause_closed = true;
+                        continue;
+                    }
                     if *self.pause_rx.borrow() {
                         let _ = self.engine.stop().await;
                         while self.chunk_rx.try_recv().is_ok() {}
@@ -187,7 +205,11 @@ impl Pipeline {
                         }
                     }
                 }
-                _ = self.cancel_rx.changed() => {}
+                res = self.cancel_rx.changed(), if !cancel_closed => {
+                    if res.is_err() {
+                        cancel_closed = true;
+                    }
+                }
                 maybe_segment = self.chunk_rx.recv() => {
                     match maybe_segment {
                         Some(segment) => {

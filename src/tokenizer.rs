@@ -209,6 +209,8 @@ impl Tokenizer {
         let mut last_delta_ts: Option<Instant> = None;
         let mut eager_chunks_remaining = self.config.eager_chunks;
         let eager_chunks_default = eager_chunks_remaining;
+        let mut cancel_closed = false;
+        let mut pause_closed = false;
 
         let min_chars = self.config.min_chars;
         let max_chars = self.config.max_chars;
@@ -225,10 +227,18 @@ impl Tokenizer {
         let mut relax_active = false;
         loop {
             tokio::select! {
-                _ = self.cancel_rx.changed() => {
+                res = self.cancel_rx.changed(), if !cancel_closed => {
+                    if res.is_err() {
+                        cancel_closed = true;
+                        continue;
+                    }
                     if *self.cancel_rx.borrow() { break; }
                 }
-                _ = self.pause_rx.changed() => {
+                res = self.pause_rx.changed(), if !pause_closed => {
+                    if res.is_err() {
+                        pause_closed = true;
+                        continue;
+                    }
                     if *self.pause_rx.borrow() {
                         buf.clear();
                         first = true;
