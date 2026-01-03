@@ -5,12 +5,30 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util"] }
-reqwest = { version = "0.12", features = ["json", "stream"] }
-async-openai = { version = "0.32.2", features = ["byot", "chat-completion", "native-tls"] }
-serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util", "signal", "io-std"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 async-trait = "0.1"
+crossbeam-queue = "0.3"
+rand_core = { version = "=0.10.0-rc-2", default-features = false }
+
+# Optional: GPT-SoVITS (Windows + CUDA) backend
+# Pin to the commit that updates `tch` to support libtorch 2.9.
+gpt_sovits_rs = { git = "https://github.com/second-state/gpt_sovits_rs", rev = "198a07f9dd8e440d186c8e097b79f0c74c46b5df", optional = true }
+rodio = { version = "0.21.1", optional = true }
+wav_io = { version = "0.1.14", optional = true }
+jieba-rs = { version = "0.8", optional = true }
+# Optional: GPT-SoVITS ONNX (CPU) backend
+gpt_sovits_onnx_rs = { package = "gpt-sovits-onnx-rs", git = "https://github.com/null-define/gpt-sovits-onnx-rs", rev = "01d76cf190e04ce681b4dae6104ce1b3baee2ab7", optional = true }
+
+[features]
+default = []
+gpt-sovits = ["dep:gpt_sovits_rs", "dep:wav_io", "tokenizer-jieba", "audio-rodio"]
+gpt-sovits-onnx = ["dep:gpt_sovits_onnx_rs", "audio-rodio"]
+audio-rodio = ["dep:rodio"]
+tokenizer-jieba = ["dep:jieba-rs"]
+
+[dev-dependencies]
+async-openai = { version = "0.32.2", features = ["byot", "chat-completion", "native-tls"] }
+serde_json = "1"
 futures = "0.3"
-unicode-segmentation = "1.12"

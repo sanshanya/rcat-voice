@@ -1,5 +1,37 @@
-pub mod chunker;
-pub mod deepseek;
-pub mod player;
-pub mod sentence_splitter;
-pub mod tts;
+//! Streaming text-to-speech pipeline with pluggable backends.
+//!
+//! Basic usage (OS TTS backend, no extra features required):
+//! ```no_run
+//! use rcat_voice::prelude::*;
+//! # #[tokio::main]
+//! # async fn main() -> anyhow::Result<()> {
+//! let tts = TtsEngineBuilder::new(TtsBackend::Os).build()?;
+//! let session = StreamSession::builder(tts.clone()).build();
+//! let control = session.control();
+//! control.mark_llm_start();
+//! control.sender().send("Hello,".to_string()).await?;
+//! control.sender().send(" world!".to_string()).await?;
+//! session.shutdown().await?;
+//! # Ok(())
+//! # }
+//! ```
+
+pub mod audio;
+pub mod generator;
+pub mod pipeline;
+pub mod streaming;
+pub mod tokenizer;
+
+pub mod prelude {
+    pub use crate::audio::{AudioBackend, AudioBackendKind, AudioConfig, RodioConfig};
+    pub use crate::generator::{
+        SynthesizedAudio, TtsBackend, TtsEngine, TtsEngineBuilder, TtsMetrics,
+    };
+    pub use crate::pipeline::PipelineConfig;
+    pub use crate::streaming::{StreamConfig, StreamControl, StreamSession, StreamSessionBuilder};
+    pub use crate::tokenizer::{Segment, TokenizerConfig};
+    #[cfg(all(feature = "gpt-sovits", target_os = "windows"))]
+    pub use crate::generator::{GptSovitsChunkPolicy, GptSovitsConfig};
+    #[cfg(feature = "gpt-sovits-onnx")]
+    pub use crate::generator::{GptSovitsOnnxConfig, GptSovitsOnnxSampling};
+}

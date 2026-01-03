@@ -1,358 +1,254 @@
 # rcat-voice
 
+流式文本 -> TTS 管线。核心库只消费文本 delta，LLM 集成放在 examples。
+
+## 作为库使用
+
+### 最小示例（OS TTS，无需额外特性）
+
+```rust
+use rcat_voice::prelude::*;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let tts = TtsEngineBuilder::new(TtsBackend::Os).build()?;
+    let session = StreamSession::builder(tts.clone()).build();
+    let control = session.control();
+    control.mark_llm_start();
+    control.sender().send("Hello,".to_string()).await?;
+    control.sender().send(" world!".to_string()).await?;
+    session.shutdown().await?;
+    Ok(())
+}
+```
 
-### 🏗️ 技术架构
+### 典型用法（CUDA GPT-SoVITS）
 
-#### **核心模块** （7个文件）
+需要启用 `gpt-sovits` 特性，并在 Windows + CUDA LibTorch 环境运行。
 
-1. **deepseek.rs** - LLM 流式客户端
+```rust
+use rcat_voice::prelude::*;
 
-* 使用
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let audio = rcat_voice::audio::build(&AudioConfig::default())?;
+    let config = GptSovitsConfig::from_dir("v2pro")?;
+    let tts = TtsEngineBuilder::new(TtsBackend::GptSovits(config))
+        .audio_backend(audio)
+        .build()?;
+    let session = StreamSession::builder(tts.clone()).build();
+    // ... send deltas via session.control().sender()
+    session.shutdown().await?;
+    Ok(())
+}
+```
 
-  ```
-  async-openai
-  ```
+如果希望继续使用环境变量风格的配置，可用 `*_from_env()` / `StreamSession::from_env()`。
 
-  库
-* 支持 DeepSeek/OpenAI 兼容 API
-* SSE 流式输出（逐字返回）
+常用配置入口：
 
-1. **sentence_splitter.rs** - 句子边界检测 ⭐
+- `AudioConfig` / `RodioConfig`
+- `TokenizerConfig`
+- `PipelineConfig`
+- `StreamConfig`
+- `GptSovitsConfig` / `GptSovitsOnnxConfig`
 
-* 纯 Rust 实现（
+## 快速开始（Windows + CUDA GPT-SoVITS）
 
-  ```
-  unicode-segmentation
-  ```
+1) 安装 Rust（MSVC 工具链）。
+2) 安装 CUDA LibTorch（2.9 版）并在当前终端设置环境变量：
 
-  ）
-* 中英文语言检测
-* 智能断句规则（支持缩写词如 Dr./Mr.）
-* 完整测试覆盖
+```powershell
+$env:LIBTORCH="C:\libtorch"
+$env:Path="$env:LIBTORCH\lib;$env:Path"
+```
 
-1. **chunker.rs** - 自适应文本分块器
+3) 把 GPT-SoVITS 模型放到 `v2pro/`（与 `Cargo.toml` 同级，可用 `GSV_MODEL_DIR` 指定其他目录）：
 
-* **动态调整策略** ：根据播放队列长度调整分块大小
-  * 首段：10-20字符（快速首播）
-  * 低缓冲区：20-45字符（快速补充）
-  * 高缓冲区：80-140字符（批量处理）
-* 智能边界检测（强边界：。！？，弱边界：，；：）
-* 估算播放时长（180ms/字符）
+- `mini-bart-g2p.pt`
+- `g2pw_model.pt`（或 `g2pw.pt`）
+- `bert_model.pt`（或 `bert.pt`）
+- `ssl_model.pt`（或 `ssl.pt`）
+- `t2s.pt` + `vits.pt`（或 `gpt_sovits_v2pro.cuda.pt` 作为合并权重）
+- `ref.wav` + `ref.txt`
 
-1. **player.rs** - 音频播放器
+`ref.wav` 会自动转单声道并重采样到 32k。
 
-* 异步播放管理
-* **详细性能指标输出** ：
-  * LLM首字时延
-  * 分段器延迟
-  * 首播时延
-  * 音频播放完成时间
-* 取消/停止支持
+4) 运行模拟流式示例：
 
-1. **tts.rs** - TTS 引擎抽象层
+```bash
+cargo run --example stream_sim --features gpt-sovits
+```
 
-* 跨平台系统 TTS：
+## 快速开始（CPU ONNX GPT-SoVITS）
 
-  * **Windows** : PowerShell + System.Speech
-  * **macOS** :
+1) 按 `gpt-sovits-onnx-rs` 的 `scripts/README.md` 转换模型，得到 ONNX 模型目录。
+2) 把模型放到 `onnx/`（与 `Cargo.toml` 同级，或通过 `GSV_ONNX_MODEL_DIR` 指定）：
 
-  ```
-  say
-  ```
+- `custom_vits.onnx`
+- `ssl.onnx`
+- `custom_t2s_encoder.onnx`
+- `custom_t2s_fs_decoder.onnx`
+- `custom_t2s_s_decoder.onnx`
+- `g2pW.onnx`（可选，但建议保留）
+- `bert.onnx`（可选，但建议保留）
+- `g2p_en/`（可选，包含 `encoder_model.onnx` / `decoder_model.onnx`）
+- `sv.onnx`（可选）
+- `ref.wav` + `ref.txt`
 
-  命令
+`ref.wav` 需为单声道 16-bit PCM，采样率不限（会自动重采样到 16k/32k）。
+若导出前缀不是 `custom`，请设置 `GSV_ONNX_EXPORT_NAME`。
 
-  * **Linux** :
+3) 运行示例：
 
-  ```
-  spd-say
-  ```
-* 异步进程管理
-* 支持中断/停止
+```bash
+TTS_BACKEND=gpt-sovits-onnx \
+GSV_ONNX_MODEL_DIR=onnx \
+cargo run --example stream_sim --features gpt-sovits-onnx
+```
 
-1. **main.rs** - 管道编排
+## 编译与后端选择
 
-* 三阶段管道：LLM → Chunker → Player
-* 基于 tokio channel 的流式通信
-* 共享状态管理（队列估算）
+后端选择在运行时通过环境变量控制（`TTS_BACKEND`、`AUDIO_BACKEND`）。
+特性只决定哪些后端被编译。
 
-1. **lib.rs** - 库入口
+如果希望运行时随时切换后端，可一次性编译全部特性：
 
----
+```bash
+cargo build --all-features
+```
 
-### 📈 最近开发重点（根据会话历史）
+运行时选择示例：
 
-#### **2025-12-30 会话：增强 TTS 指标**
+```powershell
+$env:TTS_BACKEND="gpt-sovits"  # 或 "gpt-sovits-onnx" / "os"
+$env:AUDIO_BACKEND="rodio"
+```
 
-核心目标：实现**全链路性能追踪**
+## 示例
 
- **实现的关键指标** ：
+- `stream_sim`：模拟 LLM 流式增量。
 
-* **t0** : Task Start（任务开始）
-* **t1** : TTFT（Time To First Token） - LLM首字时延
-* **t2** : TTST（Time To Send Text）- 分段器延迟
-* **TTFA** （Time To First Audio）- 首播时延
-* **TTPT** （Time To Play Time）- 播放完成时间
-* **TTS_TIME** - 总处理时间
+```bash
+cargo run --example stream_sim --features gpt-sovits
+```
 
- **技术选型** ：
+- `deepseek_stream`：从 OpenAI/DeepSeek 兼容 SSE 拉流。
 
-* ✅ 采用纯 Rust 实现（
+```bash
+cargo run --example deepseek_stream --features gpt-sovits
+```
 
-  ```
-  unicode-segmentation
-  ```
+- `terminal_chat`：终端交互，输入新内容会取消上一轮。
 
-  ）
-* ❌ 放弃 Python 库（如
+```bash
+cargo run --example terminal_chat --features gpt-sovits
+```
 
-  ```
-  nltk
-  ```
+如需运行时切换后端，编译时可改用 `--all-features`。
+使用 ONNX 后端时，将特性替换为 `gpt-sovits-onnx` 并设置 `TTS_BACKEND=gpt-sovits-onnx`。
 
-  ）- 兼容性问题
+## 结构说明
 
----
+- `src/streaming.rs`：`StreamSession` / `StreamControl`（会话与控制）
+- `src/tokenizer.rs`：分段与 relax
+- `src/pipeline.rs`：TTS 调度与播放指标
+- `src/generator/`：TTS 后端（`gpt-sovits` / `gpt-sovits-onnx` / `os` / `remote` 占位）
+- `src/audio/`：音频后端（`rodio` / `wasapi` 占位 / `system` 占位）
 
-### 📦 依赖栈
+更详细的架构说明见 `docs/ARCHITECTURE.md`。
 
-<pre><div><div class="min-h-7 relative box-border flex flex-row items-center justify-between rounded-t border border-b-0 border-gray-500/25 px-2 py-0.5"><div class="font-sans text-sm text-ide-text-color opacity-60">toml</div><div><div class="flex flex-row items-center gap-0.5"><div class="rounded-sm p-1 cursor-pointer opacity-60 hover:bg-gray-500/25 hover:opacity-100"><span data-tooltip-id="At mention" class="text-ide-text-color"><svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" aria-hidden="true" data-slot="icon" class="h-3.5 w-3.5"><path stroke-linecap="round" stroke-linejoin="round" d="M16.5 12a4.5 4.5 0 1 1-9 0 4.5 4.5 0 0 1 9 0Zm0 0c0 1.657 1.007 3 2.25 3S21 13.657 21 12a9 9 0 1 0-2.636 6.364M16.5 12V8.25"></path></svg></span></div><div class="rounded-sm p-1 cursor-pointer opacity-60 hover:bg-gray-500/25 hover:opacity-100"><span data-tooltip-id="Copy" class="text-ide-text-color"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-copy h-3.5 w-3.5"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"></rect><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"></path></svg></span></div></div></div></div><div class="language-toml relative overflow-hidden rounded-b border-x border-b border-gray-500/25 bg-ide-editor-background p-2" aria-label="highlighted-code-language-toml"><div class="w-full h-full text-xs cursor-text"><div class="code-block"><div class="code-line" data-line-number="1" data-line-start="1" data-line-end="1"><div class="line-content"><span class="mtk1">tokio (异步运行时)</span></div></div><div class="code-line" data-line-number="2" data-line-start="2" data-line-end="2"><div class="line-content"><span class="mtk1">async-openai (LLM 客户端)</span></div></div><div class="code-line" data-line-number="3" data-line-start="3" data-line-end="3"><div class="line-content"><span class="mtk1">unicode-segmentation (句子分割)</span></div></div><div class="code-line" data-line-number="4" data-line-start="4" data-line-end="4"><div class="line-content"><span class="mtk1">reqwest (HTTP 客户端)</span></div></div><div class="code-line" data-line-number="5" data-line-start="5" data-line-end="5"><div class="line-content"><span class="mtk1">serde_json (数据序列化)</span></div></div><div class="code-line" data-line-number="6" data-line-start="6" data-line-end="6"><div class="line-content"><span class="mtk1">tracing (日志追踪)</span></div></div><div class="code-line" data-line-number="7" data-line-start="7" data-line-end="7"><div class="line-content"><span class="mtk1">anyhow (错误处理)</span></div></div></div></div></div></div></pre>
+## 环境变量
 
----
+以下环境变量仅影响 `*_from_env` / `StreamSession::from_env` / `build_from_env` 相关路径；显式配置不会依赖环境变量。
 
-### ✅ 项目完成度
+### 核心
 
- **已实现功能** ：
+- `TTS_BACKEND`：`gpt-sovits` | `gpt-sovits-onnx` | `os` | `remote`
+  - 默认：Windows + 启用 `gpt-sovits` 特性时为 `gpt-sovits`，否则 `os`
+- `TTS_PARALLEL_SYNTH`：`1`/`0`（默认 `1`；支持的后端会先合成再排队播放）
+- `TTS_SYNTH_INFLIGHT`：并行合成的最大任务数（默认 `1`，可适当调大）
+- `AUDIO_BACKEND`：`rodio`（默认）
 
-* ✅ 完整的流式管道（LLM → TTS）
-* ✅ 自适应文本分块
-* ✅ 中英文句子分割
-* ✅ 详细性能指标
-* ✅ 跨平台 TTS 支持
-* ✅ 取消/中断机制
-* ✅ 单元测试（
+### Audio（rodio）
 
-  ```
-  sentence_splitter
-  ```
+- `AUDIO_RING_SECONDS`：环形缓冲时长（默认 60）
+- `AUDIO_PREFILL_MS`：预填充时长（默认 50）
+- `AUDIO_BUFFER_POLL_MS`：水位轮询间隔（默认 20）
+- `AUDIO_SAMPLE_RATE`：输出采样率（默认 32000）
+- `AUDIO_CHANNELS`：输出声道数（默认 1）
 
-  ）
+### 分段器
 
- **当前状态** ：
+- `CHUNKER_EAGER_CHUNKS`：首段短切数量（默认 2）
+- `TOKENIZER_MIN_CHARS`：最小字符数（默认 20）
+- `TOKENIZER_MAX_CHARS`：常规最大字符数（默认 50）
+- `TOKENIZER_BOUNDARY_OVERFLOW`：等待边界的额外字符数（默认 20）
+- `TOKENIZER_RELAX_BUFFER_MS`：缓存水位达到该值后放松分段（默认 200）
+- `TOKENIZER_RELAX_SCALE`：放松倍率（默认 1.5）
+- 说明：`relaxed_max = TOKENIZER_MAX_CHARS * TOKENIZER_RELAX_SCALE`，上限为 120
+- `TOKENIZER_RELAX_BOUNDARY_WINDOW`：优先边界窗口（默认 24）
+- `TOKENIZER_RELAX_OVERFLOW`：放松模式下的额外超出（默认 30）
+- `TOKENIZER_RELAX_LOG=1`：打印放松状态切换日志
 
-* 📁 光标位置：
+放松分段依赖 `buffered_ms()` 水位（目前仅 `rodio` 支持）。
 
-  sentence_splitter.rs 第54行（断句逻辑核心）
-* 🔧 最近修改：性能指标追踪、句子分割器
-* 📊 项目成熟度： **POC 阶段** （可运行的原型）
+### GPT-SoVITS
 
----
+- `GSV_MODEL_DIR`：模型目录（默认 `v2pro`）
+- `GSV_TOP_K`：解码 top-k（默认 15）
+- `GSV_FIRST_TOP_K`：首段 top-k（默认 12）
+- `GSV_FIRST_CHUNK_TOKENS`：每段首块音频 token 目标（默认 10，clamp 3-25）
+  - 后续块默认使用 25/50/100（逐步增大以提升连贯性与吞吐）
+- `GSV_MAX_CUT_TOKEN`：`next_chunk` 最大切分 token（默认 25，clamp 25-1024）
+- `GSV_TEXT_METRICS=1`：打印文本前处理 / stream 指标
+- `GSV_JIEBA_BENCH=1`：额外 jieba cut 用于 profiling
+- `GSV_FIRST_CHUNK_DYNAMIC`：`1`/`0`（默认 `1`，首块 token 动态调节）
+- `GSV_FIRST_CHUNK_SHORT_CHARS`：短句阈值（默认 12）
+- `GSV_FIRST_CHUNK_MID_CHARS`：中句阈值（默认 24）
+- `GSV_FIRST_CHUNK_SHORT_TOKENS`：短句首块 token（默认 6）
+- `GSV_FIRST_CHUNK_MID_TOKENS`：中句首块 token（默认 8）
 
-### 🚀 优化空间/潜在改进
+### GPT-SoVITS ONNX
 
-1. **句子分割器** （当前打开文件）
+- `GSV_ONNX_MODEL_DIR`：模型目录（默认 `onnx`）
+- `GSV_ONNX_EXPORT_NAME`：导出前缀（默认 `custom`）
+- `GSV_ONNX_REF_WAV`：参考音频路径（默认 `ref.wav`）
+- `GSV_ONNX_REF_TEXT`：参考文本（默认读取 `ref.txt`）
+- `GSV_ONNX_LANG`：`auto` | `yue`（默认 `auto`）
+- `GSV_ONNX_TOP_K`：top-k（默认 4，设为 0 表示关闭）
+- `GSV_ONNX_TOP_P`：top-p（默认 0.9，设为 ≥1 表示关闭）
+- `GSV_ONNX_TEMPERATURE`：temperature（默认 1.0）
+- `GSV_ONNX_REP_PENALTY`：repetition penalty（默认 1.35）
+- `GSV_ONNX_CHUNK_SAMPLES`：推送到音频后端的分块采样数（默认 2048）
+- `GSV_ONNX_BERT_PATH`：可选，自定义 `bert.onnx` 路径
+- `GSV_ONNX_G2PW_PATH`：可选，自定义 `g2pW.onnx` 路径
+- `GSV_ONNX_G2P_EN_PATH`：可选，自定义 `g2p_en/` 目录（需含 `encoder_model.onnx` / `decoder_model.onnx`）
+- `GSV_ONNX_SV_PATH`：可选，自定义 `sv.onnx` 路径
 
-* 可扩展更多语言支持
-* 更复杂的缩写词处理
+### 示例（stream_sim）
 
-1. **TTS 引擎**
-   * 可集成远程 TTS 服务（更高质量）
-   * 语音参数配置（语速/音调）
-2. **测试覆盖**
-   * 需要为其他模块添加测试
-   * 集成测试
-3. **文档**
-   * 无 README（建议添加）
-   * 缺少使用说明
-4. **错误处理**
-   * 可改进错误恢复机制
+- `STREAM_SIM_DRAIN_MS`：发送结束后等待播放完成的最长时长（默认 10000）
 
----
+### 主程序（内置模拟流，仅用于本地验证）
 
-### 🎯 项目定位总结
+- `LLM_ROUNDS`：轮数（默认 2）
+- `LLM_SIM_TEXT`：模拟文本
+- `LLM_SIM_CHUNK_CHARS`：每次发送字符数（默认 3）
+- `LLM_SIM_DELAY_MS`：发送间隔（默认 80）
+- `AUTO_CANCEL_DELAY_MS`：第 3 轮自动取消（默认 1500）
 
-这是一个 **高度优化的实时流式 TTS 系统** ，重点在于：
+说明：以上仅作用于 `cargo run` 的内置模拟流。真实对话请使用 examples。 
 
-* 最小化延迟（特别是首播延迟 TTFA）
-* 智能资源管理（自适应分块）
-* 详细的性能观测
+### LLM 示例
 
-从代码质量看，这是一个**结构清晰、设计合理**的 Rust 异步项目，适合作为流式 AI 应用的基础框架。
+- `OPENAI_BASE_URL`：API Base（默认 `https://api.deepseek.com/v1`）
+- `OPENAI_API_KEY`：API Key（必填）
+- `OPENAI_MODEL`：模型名（默认 `deepseek-chat`）
 
-### 🏗️ 技术架构
+## 备注
 
-#### **核心模块** （7个文件）
-
-1. **deepseek.rs** - LLM 流式客户端
-
-* 使用
-
-  ```
-  async-openai
-  ```
-
-  库
-* 支持 DeepSeek/OpenAI 兼容 API
-* SSE 流式输出（逐字返回）
-
-1. **sentence_splitter.rs** - 句子边界检测 ⭐
-
-* 纯 Rust 实现（
-
-  ```
-  unicode-segmentation
-  ```
-
-  ）
-* 中英文语言检测
-* 智能断句规则（支持缩写词如 Dr./Mr.）
-* 完整测试覆盖
-
-1. **chunker.rs** - 自适应文本分块器
-
-* **动态调整策略** ：根据播放队列长度调整分块大小
-  * 首段：10-20字符（快速首播）
-  * 低缓冲区：20-45字符（快速补充）
-  * 高缓冲区：80-140字符（批量处理）
-* 智能边界检测（强边界：。！？，弱边界：，；：）
-* 估算播放时长（180ms/字符）
-
-1. **player.rs** - 音频播放器
-
-* 异步播放管理
-* **详细性能指标输出** ：
-  * LLM首字时延
-  * 分段器延迟
-  * 首播时延
-  * 音频播放完成时间
-* 取消/停止支持
-
-1. **tts.rs** - TTS 引擎抽象层
-
-* 跨平台系统 TTS：
-
-  * **Windows** : PowerShell + System.Speech
-  * **macOS** :
-
-  ```
-  say
-  ```
-
-  命令
-
-  * **Linux** :
-
-  ```
-  spd-say
-  ```
-* 异步进程管理
-* 支持中断/停止
-
-1. **main.rs** - 管道编排
-
-* 三阶段管道：LLM → Chunker → Player
-* 基于 tokio channel 的流式通信
-* 共享状态管理（队列估算）
-
-1. **lib.rs** - 库入口
-
----
-
-### 📈 最近开发重点（根据会话历史）
-
-#### **2025-12-30 会话：增强 TTS 指标**
-
-核心目标：实现**全链路性能追踪**
-
- **实现的关键指标** ：
-
-* **t0** : Task Start（任务开始）
-* **t1** : TTFT（Time To First Token） - LLM首字时延
-* **t2** : TTST（Time To Send Text）- 分段器延迟
-* **TTFA** （Time To First Audio）- 首播时延
-* **TTPT** （Time To Play Time）- 播放完成时间
-* **TTS_TIME** - 总处理时间
-
- **技术选型** ：
-
-* ✅ 采用纯 Rust 实现（
-
-  ```
-  unicode-segmentation
-  ```
-
-  ）
-* ❌ 放弃 Python 库（如
-
-  ```
-  nltk
-  ```
-
-  ）- 兼容性问题
-
----
-
-### 📦 依赖栈
-
-<pre><div><div class="min-h-7 relative box-border flex flex-row items-center justify-between rounded-t border border-b-0 border-gray-500/25 px-2 py-0.5"><div class="font-sans text-sm text-ide-text-color opacity-60">toml</div><div><div class="flex flex-row items-center gap-0.5"><div class="rounded-sm p-1 cursor-pointer opacity-60 hover:bg-gray-500/25 hover:opacity-100"><span data-tooltip-id="At mention" class="text-ide-text-color"><svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" aria-hidden="true" data-slot="icon" class="h-3.5 w-3.5"><path stroke-linecap="round" stroke-linejoin="round" d="M16.5 12a4.5 4.5 0 1 1-9 0 4.5 4.5 0 0 1 9 0Zm0 0c0 1.657 1.007 3 2.25 3S21 13.657 21 12a9 9 0 1 0-2.636 6.364M16.5 12V8.25"></path></svg></span></div><div class="rounded-sm p-1 cursor-pointer opacity-60 hover:bg-gray-500/25 hover:opacity-100"><span data-tooltip-id="Copy" class="text-ide-text-color"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-copy h-3.5 w-3.5"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"></rect><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"></path></svg></span></div></div></div></div><div class="language-toml relative overflow-hidden rounded-b border-x border-b border-gray-500/25 bg-ide-editor-background p-2" aria-label="highlighted-code-language-toml"><div class="w-full h-full text-xs cursor-text"><div class="code-block"><div class="code-line" data-line-number="1" data-line-start="1" data-line-end="1"><div class="line-content"><span class="mtk1">tokio (异步运行时)</span></div></div><div class="code-line" data-line-number="2" data-line-start="2" data-line-end="2"><div class="line-content"><span class="mtk1">async-openai (LLM 客户端)</span></div></div><div class="code-line" data-line-number="3" data-line-start="3" data-line-end="3"><div class="line-content"><span class="mtk1">unicode-segmentation (句子分割)</span></div></div><div class="code-line" data-line-number="4" data-line-start="4" data-line-end="4"><div class="line-content"><span class="mtk1">reqwest (HTTP 客户端)</span></div></div><div class="code-line" data-line-number="5" data-line-start="5" data-line-end="5"><div class="line-content"><span class="mtk1">serde_json (数据序列化)</span></div></div><div class="code-line" data-line-number="6" data-line-start="6" data-line-end="6"><div class="line-content"><span class="mtk1">tracing (日志追踪)</span></div></div><div class="code-line" data-line-number="7" data-line-start="7" data-line-end="7"><div class="line-content"><span class="mtk1">anyhow (错误处理)</span></div></div></div></div></div></div></pre>
-
----
-
-### ✅ 项目完成度
-
- **已实现功能** ：
-
-* ✅ 完整的流式管道（LLM → TTS）
-* ✅ 自适应文本分块
-* ✅ 中英文句子分割
-* ✅ 详细性能指标
-* ✅ 跨平台 TTS 支持
-* ✅ 取消/中断机制
-* ✅ 单元测试（
-
-  ```
-  sentence_splitter
-  ```
-
-  ）
-
- **当前状态** ：
-
-* 📁 光标位置：
-
-  sentence_splitter.rs 第54行（断句逻辑核心）
-* 🔧 最近修改：性能指标追踪、句子分割器
-* 📊 项目成熟度： **POC 阶段** （可运行的原型）
-
----
-
-### 🚀 优化空间/潜在改进
-
-1. **句子分割器** （当前打开文件）
-
-* 可扩展更多语言支持
-* 更复杂的缩写词处理
-
-1. **TTS 引擎**
-   * 可集成远程 TTS 服务（更高质量）
-   * 语音参数配置（语速/音调）
-2. **测试覆盖**
-   * 需要为其他模块添加测试
-   * 集成测试
-3. **文档**
-   * 无 README（建议添加）
-   * 缺少使用说明
-4. **错误处理**
-   * 可改进错误恢复机制
-
----
-
-### 🎯 项目定位总结
-
-这是一个 **高度优化的实时流式 TTS 系统** ，重点在于：
-
-* 最小化延迟（特别是首播延迟 TTFA）
-* 智能资源管理（自适应分块）
-* 详细的性能观测
-
-从代码质量看，这是一个**结构清晰、设计合理**的 Rust 异步项目，适合作为流式 AI 应用的基础框架。
+- GPT-SoVITS 后端仅支持 Windows + CUDA LibTorch。
+- GPT-SoVITS ONNX 后端基于 ONNX Runtime，CPU 推理，参考音频需为单声道 16-bit PCM。
+- `StreamControl::pause()` 是中断行为，不提供恢复；需要重新发起流或新建会话。
+- Rodio 后端使用 `crossbeam-queue` 实现无锁缓冲。
