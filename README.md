@@ -61,6 +61,7 @@ async fn main() -> anyhow::Result<()> {
 ```powershell
 $env:LIBTORCH="C:\libtorch"
 $env:Path="$env:LIBTORCH\lib;$env:Path"
+$env:LIBTORCH_BYPASS_VERSION_CHECK="1"   # 可选：若 torch-sys 报 PyTorch 版本不匹配（如 2.9.1 vs 2.9.0）
 ```
 
 3) 把 GPT-SoVITS 模型放到 `v2pro/`（与 `Cargo.toml` 同级，可用 `GSV_MODEL_DIR` 指定其他目录）：
@@ -160,6 +161,27 @@ ASR_METRICS=1 \
 cargo run --example asr_file --features asr-sherpa -- path/to/audio.wav
 ```
 
+3) 运行麦克风流式识别示例（Windows/macOS，按 VAD 端点输出分段；可选 Smart Turn 判定轮次结束）：
+
+```powershell
+$env:ASR_MODELS_ROOT="asrmodel"
+$env:ASR_MODEL="funasr-nano-int8"
+$env:ASR_VAD_MIN_SILENCE="0.45"   # 可选：更大=分段更少/更不敏感，但会更晚出结果
+cargo run --example asr_mic --features asr-sherpa,asr-mic --release
+```
+
+启用 Smart Turn（在静音处更贴近“人类期望”的 turn end 判断）：
+
+```powershell
+$env:ASR_MODELS_ROOT="asrmodel"
+$env:ASR_MODEL="funasr-nano-int8"
+$env:SMART_TURN_MODEL="path\to\smart-turn-v3*.onnx"  # 也可填目录（自动寻找 smart-turn*.onnx）
+$env:SMART_TURN_THRESHOLD="0.5"
+$env:SMART_TURN_MIN_SILENCE_MS="400"   # 可选：更大=更不敏感
+$env:SMART_TURN_COMMIT_MS="300"        # 可选：更大=更不敏感（会更慢确认 turn end）
+cargo run --example asr_mic --features asr-sherpa,asr-mic,turn-smart --release
+```
+
 ## 编译与后端选择
 
 后端选择在运行时通过环境变量控制（`TTS_BACKEND`、`AUDIO_BACKEND`）。
@@ -198,6 +220,44 @@ cargo run --example deepseek_stream --features gpt-sovits
 cargo run --example terminal_chat --features gpt-sovits
 ```
 
+- `voice_assistant`：麦克风 ASR → Smart Turn → LLM 流式 → TTS 流式（支持保守 barge-in：连续说话达到阈值才打断）。
+
+先用 OS TTS 跑通（不依赖 GPT-SoVITS/CUDA）：
+
+```powershell
+$env:OPENAI_API_KEY="..."                 # 必填
+$env:OPENAI_BASE_URL="https://api.deepseek.com/v1"   # 可选
+$env:OPENAI_MODEL="deepseek-chat"         # 可选
+
+$env:TTS_BACKEND="os"                     # 可选：先跑通建议用 os
+
+$env:ASR_MODELS_ROOT="asrmodel"
+$env:ASR_MODEL="funasr-nano-int8"
+$env:ASR_VAD_MIN_SILENCE="0.45"           # 可选：更不敏感=更少切段
+
+$env:SMART_TURN_MODEL="path\to\smart-turn-v3*.onnx"  # 可选：不填则每个 VAD 分段视为一个 turn
+$env:SMART_TURN_THRESHOLD="0.5"
+
+$env:BARGE_IN_MIN_SPEECH_MS="450"         # 可选：连续说话 >= 450ms 才触发打断（更大=更不容易误打断）
+cargo run --example voice_assistant --features asr-sherpa,asr-mic,turn-smart --release
+```
+
+使用 GPU GPT-SoVITS（Windows + CUDA LibTorch）：
+
+```powershell
+$env:LIBTORCH="C:\libtorch"
+$env:Path="$env:LIBTORCH\lib;$env:Path"
+$env:LIBTORCH_BYPASS_VERSION_CHECK="1"    # 可选：若 torch-sys 报版本不匹配
+
+$env:TTS_BACKEND="gpt-sovits"
+$env:GSV_MODEL_DIR="v2pro"                # 默认就是 v2pro，可按需改成绝对路径
+$env:AUDIO_BACKEND="rodio"
+$env:AUDIO_SAMPLE_RATE="32000"
+$env:AUDIO_CHANNELS="1"
+
+cargo run --example voice_assistant --features asr-sherpa,asr-mic,turn-smart,gpt-sovits --release
+```
+
 如需运行时切换后端，编译时可改用 `--all-features`。
 使用 ONNX 后端时，将特性替换为 `gpt-sovits-onnx` 并设置 `TTS_BACKEND=gpt-sovits-onnx`。
 
@@ -209,8 +269,10 @@ cargo run --example terminal_chat --features gpt-sovits
 - `src/generator/`：TTS 后端（`gpt-sovits` / `gpt-sovits-onnx` / `os` / `remote` 占位）
 - `src/audio/`：音频后端（`rodio` / `wasapi` 占位 / `system` 占位）
 - `src/asr/`：ASR（目前：`asr-sherpa` / SenseVoice + Silero VAD）
+- `src/turn/`：Turn detection（可选：Smart Turn ONNX）
 
 更详细的架构说明见 `docs/ARCHITECTURE.md`。
+流程优化建议见 `docs/OPTIMIZATIONS.md`。
 
 ## 环境变量
 
@@ -298,6 +360,12 @@ cargo run --example terminal_chat --features gpt-sovits
 - `ASR_VAD_WINDOW`：VAD window size（默认 `512`）
 - `ASR_VAD_BUFFER_SECONDS`：VAD 环形缓冲秒数（默认 `100`）
 
+### Turn detection（Smart Turn）
+
+- 特性：`turn-smart`
+- `SMART_TURN_MODEL`：Smart Turn ONNX 模型路径（必填；输入 16kHz mono，窗口固定 8s）
+- `SMART_TURN_THRESHOLD`：端点阈值（默认 `0.5`，范围 `0.0-1.0`）
+
 ### 示例（stream_sim）
 
 - `STREAM_SIM_DRAIN_MS`：发送结束后等待播放完成的最长时长（默认 10000）
@@ -309,6 +377,13 @@ cargo run --example terminal_chat --features gpt-sovits
 - `ASR_METRICS=1`：打印时延/RTF 统计与每段 lag
 - `ASR_REF_FILE`：参考文本文件路径（可选，用于计算 CER）
 - `ASR_REF_TEXT`：参考文本（可选，用于计算 CER）
+
+### 示例（asr_mic）
+
+- `ASR_MIC_DEVICE`：输入设备名关键字（可选；不设置则用默认输入设备）
+- `ASR_MIC_BUFFER_FRAMES`：cpal 输入 buffer frames（可选；部分设备不支持固定值）
+- `ASR_MIC_RING_SECONDS`：输入环形缓冲秒数（默认 8）
+- `ASR_FEED_MS`：每次喂给 ASR 的 chunk 时长（默认 20）
 
 ### 主程序（内置模拟流，仅用于本地验证）
 

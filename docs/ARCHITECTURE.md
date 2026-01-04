@@ -1,176 +1,150 @@
 # rcat-voice Architecture
 
+This repository contains:
+
+- A low-latency **streaming TTS pipeline** that consumes text deltas.
+- Optional **ASR (mic/file)** and **turn detection** modules to build an end-to-end voice loop.
+- Examples that wire everything together (mic ASR → turn end → LLM stream → TTS stream).
+
+Feature flags are used to keep the core small:
+
+- `audio-rodio` (playback), `gpt-sovits` / `gpt-sovits-onnx` / `os` (TTS)
+- `asr-sherpa` (ASR via sherpa-onnx), `asr-mic` (cpal mic input)
+- `turn-smart` (Smart Turn ONNX)
+
 ## Goals
 
-- Provide a low-latency, streaming TTS pipeline that accepts text deltas.
-- Keep LLM integration out of the core library (examples only).
-- Expose a stable, typed config API; environment variables are optional.
+- Low-latency, streaming **Speech ↔ Text ↔ Speech** loop building blocks.
+- Clear lifecycle and cancellation semantics (full-duplex + barge-in friendly).
+- Typed configuration APIs; env vars are optional conveniences.
 
 ## Non-goals
 
-- Full LLM client or prompt orchestration.
-- Remote TTS service implementation (placeholder only).
+- Full “agent framework” (planning, tools, memory, etc).
+- Full LLM prompt orchestration (examples keep it minimal).
+- Remote TTS service (placeholder only).
 
 ## High-level Components
 
-- `streaming`: `StreamSession` + `StreamControl` (lifecycle + control).
-- `tokenizer`: turns deltas into `Segment` objects with timestamps.
-- `pipeline`: schedules TTS synthesis and playback.
-- `generator`: TTS backends (`gpt-sovits`, `gpt-sovits-onnx`, `os`, `remote`).
+- `asr`: offline streaming ASR (currently sherpa-onnx models) + Silero VAD segmentation.
+- `turn`: turn-end detection (Smart Turn ONNX, usually evaluated during silence).
+- `streaming`: `StreamSession` + `StreamControl` (delta ingestion, lifecycle).
+- `tokenizer`: delta → `Segment` (text chunking with timestamps).
+- `pipeline`: `Segment` → `TtsEngine` scheduling + playback metrics.
+- `generator`: TTS backends (`gpt-sovits`, `gpt-sovits-onnx`, `os`, `remote` placeholder).
 - `audio`: audio backends (`rodio`, placeholders for others).
 
-## Data Flow
+## Data Flows
+
+### TTS streaming pipeline
 
 ```
-LLM Deltas
-    |
-    v
+LLM deltas
+   |
+   v
 Tokenizer ----> Segment ----> Pipeline ----> TtsEngine ----> AudioBackend
 ```
 
-1. LLM deltas are pushed into a channel.
-2. `Tokenizer` buffers text, splits on boundaries, and emits `Segment`.
+1. LLM deltas are pushed into a channel (`StreamControl::sender()`).
+2. `Tokenizer` buffers text and flushes on boundaries, producing `Segment`.
 3. `Pipeline` consumes segments and calls `TtsEngine` to synthesize/play.
-4. `AudioBackend` plays PCM samples and reports playback completion.
+4. `AudioBackend` plays PCM samples and optionally reports playback completion.
 
-## Session Lifecycle
+### ASR streaming (offline model + VAD segmentation)
 
-`StreamSession` spawns three async tasks:
+```
+PCM (mic/file) -> resample/downmix -> Silero VAD -> speech segment -> ASR transcribe -> AsrSegment
+```
 
-- Tokenizer task (delta -> segment).
-- Pipeline task (segment -> TTS -> audio).
-- Buffer poll task (periodically reads `buffered_ms()` for adaptive chunking).
+- Input accepts `i16` PCM, any sample rate/channels (converted to 16k mono internally).
+- “Streaming” here means: you can continuously feed audio and **receive segmented results** as VAD endpoints trigger.
 
-`StreamControl` provides:
+### Full duplex demo (voice assistant)
 
-- `sender()` to push deltas.
-- `mark_llm_start()` to record t0 for metrics.
-- `pause()` to stop playback and clear queued work.
-- `cancel()` to stop playback and cancel the current stream.
+`examples/voice_assistant.rs` composes:
 
-`StreamSession::new()` uses default configs. `StreamSession::from_env()` uses
-environment variables. A builder is provided for explicit configuration.
+```
+mic -> ring buffer -> ASR segments -> (Smart Turn) -> user turn text
+                                               |
+                                               v
+                                         LLM stream (SSE)
+                                               |
+                                               v
+                                        StreamSession (TTS)
+```
+
+It also supports “conservative barge-in”: require a short continuous speech streak before cancelling the assistant.
+
+## Session Lifecycle (TTS)
+
+`StreamSession` spawns async tasks:
+
+- Tokenizer task (delta → segment).
+- Pipeline task (segment → TTS → audio).
+- Buffer poll task (reads `buffered_ms()` to enable tokenizer relax mode).
+
+Control handles:
+
+- `StreamControl`: holds delta sender + cancel/pause (keeps delta channel open).
+- `StreamCancelHandle`: cancel/pause only (does not keep delta channel open).
+
+Lifecycle APIs:
+
+- `shutdown()`: cancel + stop audio immediately, then join tasks.
+- `finish()`: close delta channel and wait for tasks to drain.
+- `finish_or_cancel(cancel_rx)`: drain like `finish()`, but abort quickly on cancel (for barge-in).
 
 ## Tokenizer Details
 
-- The tokenizer accumulates deltas into a buffer and flushes on boundaries.
-- It emits eager short chunks first (low TTFA), then normal chunks.
-- Relax mode is triggered by audio buffer waterline (`buffered_ms()`):
-  - If buffer is deep enough, it increases chunk size to improve throughput.
-- Each `Segment` contains timestamps:
-  - `task_start` (t0), `first_token_ts` (t1), `last_token_ts`, `segment_sent_ts` (t2).
+- Starts with a few “eager” short segments (lower TTFA), then normal segments.
+- Has a “relax mode” triggered by audio buffer waterline (`buffered_ms()`):
+  - if TTS buffer is deep enough, emits larger segments for throughput/efficiency.
+- Each `Segment` carries timestamps:
+  - `task_start` (t0), `first_token_ts` (t1, only first segment), `last_token_ts`, `segment_sent_ts` (t2)
 
 ## Pipeline Details
 
-- Sequential by default.
-- Parallel synth queue is only used when:
+- Sequential by default (`speak(text)`).
+- Optional parallel synth path is only used when:
   - `PipelineConfig.parallel_synth` is true, and
-  - `TtsEngine::supports_synthesis_queue()` is true.
-- `gpt-sovits` and `gpt-sovits-onnx` currently return `false` to avoid
-  misleading parallelism (they serialize on an internal mutex).
+  - the engine reports `supports_synthesis_queue() == true`.
+- `gpt-sovits` / `gpt-sovits-onnx` currently return `false` to avoid misleading parallelism
+  (they serialize on an internal mutex anyway).
 
-Playback metrics are logged using real timestamps only:
+Playback metrics:
 
-- `first_audio_ts` and `gen_done_ts` are always available.
-- `play_done_rx` is optional. If a backend does not provide it, the pipeline
-  does not log "play done" metrics for that segment.
+- `first_audio_ts` / `gen_done_ts` are always available.
+- `play_done_rx` is optional; only some audio backends (e.g. `rodio`) can provide real completion.
 
 ## Cancellation Semantics
 
-`stop()` means: terminate all in-flight synthesis and playback.
-
-Implementation:
-
-- `CancelToken` stores a monotonic epoch.
-- Each operation captures a `CancelScope` (epoch snapshot).
-- `stop()` increments the epoch and calls `AudioBackend::stop()`.
-- Loops exit when `CancelScope::is_cancelled()` is true.
-
-This prevents concurrent tasks from resetting a global cancel flag.
-
-## TTS Engine Contract
-
-`TtsEngine` defines:
-
-- `speak(text)` for direct synth+play.
-- `synthesize(text)` + `play_samples(audio)` for decoupled paths.
-- `stop()` to cancel all in-flight work.
-- `buffered_ms()` for adaptive tokenization.
-
-`TtsMetrics` fields:
-
-- `start_ts`
-- `first_audio_ts` (optional)
-- `gen_done_ts`
-- `play_done_ts`
-- `play_done_rx` (optional, for real completion)
+- TTS backends call `stop()` to terminate playback and clear queued work.
+- `audio::CancelToken` uses a monotonic epoch; work checks a `CancelScope` snapshot to avoid global mutable flags.
+- `pause` is treated as “stop and clear queued segments, then allow a new stream to start cleanly”.
 
 ## Audio Backend Contract
 
-`AudioBackend` defines:
+`AudioBackend`:
 
-- `begin_segment()` -> `SegmentWriter`
-- `stop()` to clear queued audio
-- `sample_rate()` / `channels()` / `buffered_ms()`
+- `begin_segment()` → `SegmentWriter`
+- `stop()` clears queued audio
+- `sample_rate()` / `channels()` / optional `buffered_ms()`
 
-`SegmentWriter` defines:
+`SegmentWriter`:
 
-- `push(samples, CancelScope)` for streaming PCM.
-- `finish(cancelled)` returning `SegmentPlayback` with `play_done_rx` (optional).
+- `push(samples, CancelScope)` streams PCM samples
+- `finish(cancelled)` returns `SegmentPlayback` (optionally includes `play_done_rx`)
 
 `rodio` backend:
 
-- Uses a ring buffer and a playback marker queue.
-- Supports `play_done_rx` for real playback completion timestamps.
-- Supports buffer waterline reporting via `buffered_ms()`.
+- ring buffer + playback markers
+- exposes `buffered_ms()` for tokenizer relax mode
 
-## Backend Specifics
+## ASR / Turn Detection Notes
 
-### GPT-SoVITS (CUDA)
+- ASR is “offline model + online feeding”; VAD produces segments, then ASR transcribes those segments.
+- Smart Turn is intended to run **during silence** (gated by VAD or a silence heuristic) to decide turn end.
 
-- Windows + CUDA LibTorch only.
-- Requires 32kHz mono output.
-- Uses a single internal mutex (serial inference).
-- Supports dynamic first chunk tokens to reduce TTFA.
+## Docs
 
-### GPT-SoVITS ONNX (CPU)
-
-- CPU inference via ONNX Runtime.
-- Output sample rate/channels must match audio backend.
-- Uses a single internal mutex (serial inference).
-
-### OS TTS
-
-- Uses OS commands for speech.
-- Synchronous (no playback completion callback).
-
-### Remote TTS
-
-- Placeholder; not implemented.
-
-## Configuration Model
-
-Typed configs for all major components:
-
-- `AudioConfig` / `RodioConfig`
-- `TokenizerConfig`
-- `PipelineConfig`
-- `StreamConfig`
-- `GptSovitsConfig` / `GptSovitsChunkPolicy`
-- `GptSovitsOnnxConfig` / `GptSovitsOnnxSampling`
-
-Environment variables only apply to `*_from_env` and `StreamSession::from_env`.
-Explicit configs never read the environment.
-
-## Extensibility
-
-To add a TTS backend:
-
-- Implement `TtsEngine`.
-- Decide whether you support synthesis/playback decoupling.
-- If you provide `play_done_rx`, you get real playback completion logs.
-
-To add an audio backend:
-
-- Implement `AudioBackend` + `SegmentWriter`.
-- Provide `buffered_ms()` if you want tokenizer relax mode to adapt.
+- Optimization proposals and next steps live in `docs/OPTIMIZATIONS.md`.

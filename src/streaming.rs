@@ -271,4 +271,55 @@ impl StreamSession {
         let _ = self.buffer_handle.await;
         Ok(())
     }
+
+    /// Gracefully finish the current stream: close the delta input channel and wait for
+    /// tokenizer/pipeline tasks to drain and for audio playback to complete.
+    pub async fn finish(self) -> Result<()> {
+        drop(self.control.delta_tx);
+        let _ = self.tokenizer_handle.await;
+        let _ = self.pipeline_handle.await;
+        let _ = self.buffer_handle.await;
+        Ok(())
+    }
+
+    /// Finish the stream like [`finish`](Self::finish), but abort quickly if `cancel` is triggered.
+    ///
+    /// Intended for "full duplex + barge-in": once the LLM stream ends, we still want to wait for
+    /// TTS playback to drain, but we must be able to stop immediately when the user starts speaking.
+    pub async fn finish_or_cancel(mut self, mut cancel: watch::Receiver<bool>) -> Result<()> {
+        drop(self.control.delta_tx);
+
+        let mut tokenizer_done = false;
+        let mut pipeline_done = false;
+        let mut buffer_done = false;
+        let mut cancelled = *cancel.borrow();
+
+        while !(tokenizer_done && pipeline_done && buffer_done) {
+            tokio::select! {
+                res = cancel.changed(), if !cancelled => {
+                    if res.is_ok() && *cancel.borrow() {
+                        cancelled = true;
+                        let _ = self.control.cancel_tx.send(true);
+                        let _ = self.control.tts_engine.stop().await;
+                    }
+                }
+                _ = &mut self.tokenizer_handle, if !tokenizer_done => {
+                    tokenizer_done = true;
+                }
+                _ = &mut self.pipeline_handle, if !pipeline_done => {
+                    pipeline_done = true;
+                }
+                _ = &mut self.buffer_handle, if !buffer_done => {
+                    buffer_done = true;
+                }
+            }
+        }
+
+        if cancelled {
+            let _ = self.control.cancel_tx.send(true);
+            let _ = self.control.tts_engine.stop().await;
+        }
+
+        Ok(())
+    }
 }

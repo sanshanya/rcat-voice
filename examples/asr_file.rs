@@ -156,9 +156,6 @@ fn read_wav_i16(path: &str) -> Result<(Vec<i16>, u32, u16)> {
     if spec.channels == 0 {
         bail!("wav channels must be >= 1");
     }
-    if spec.channels > 2 {
-        bail!("wav channels > 2 are not supported (got {})", spec.channels);
-    }
 
     let samples: Vec<i16> = reader
         .samples::<i16>()

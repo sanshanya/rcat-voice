@@ -11,6 +11,8 @@ tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 async-trait = "0.1"
 crossbeam-queue = "0.3"
 rand_core = { version = "=0.10.0-rc-2", default-features = false }
+cpal = { version = "0.15.3", optional = true }
+smart-turn-rs = { package = "smart-turn-rs", git = "https://github.com/miuda-ai/smart-turn-rs", rev = "92c3fca4d9ef690d142ccaf5193e6469b3517979", optional = true }
 
 # Optional: GPT-SoVITS (Windows + CUDA) backend
 # Pin to the commit that updates `tch` to support libtorch 2.9.
@@ -31,6 +33,8 @@ gpt-sovits-onnx = ["dep:gpt_sovits_onnx_rs", "audio-rodio"]
 audio-rodio = ["dep:rodio"]
 tokenizer-jieba = ["dep:jieba-rs"]
 asr-sherpa = ["dep:sherpa-rs"]
+asr-mic = ["dep:cpal"]
+turn-smart = ["dep:smart-turn-rs"]
 
 [dev-dependencies]
 async-openai = { version = "0.32.2", features = ["byot", "chat-completion", "native-tls"] }

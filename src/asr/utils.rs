@@ -15,17 +15,34 @@ pub fn pcm_i16_to_mono_f32(pcm: &[i16], channels: u16) -> Result<Vec<f32>> {
     match channels {
         0 => bail!("channels must be >= 1"),
         1 => Ok(pcm.iter().map(|&s| s as f32 / 32768.0).collect()),
-        2 => {
-            let frames = pcm.len() / 2;
+        channels => {
+            let channels = channels as usize;
+            if channels == 0 {
+                bail!("channels must be >= 1");
+            }
+            if pcm.is_empty() {
+                return Ok(Vec::new());
+            }
+            if pcm.len() % channels != 0 {
+                bail!(
+                    "pcm samples length must be a multiple of channels (len={} channels={})",
+                    pcm.len(),
+                    channels
+                );
+            }
+            let frames = pcm.len() / channels;
+            let scale = 1.0f32 / 32768.0f32;
+            let inv_channels = 1.0f32 / channels as f32;
             let mut out = Vec::with_capacity(frames);
-            for i in 0..frames {
-                let l = pcm[i * 2] as f32 / 32768.0;
-                let r = pcm[i * 2 + 1] as f32 / 32768.0;
-                out.push((l + r) * 0.5);
+            for frame in pcm.chunks_exact(channels) {
+                let mut sum = 0.0f32;
+                for &sample in frame {
+                    sum += sample as f32 * scale;
+                }
+                out.push(sum * inv_channels);
             }
             Ok(out)
         }
-        _ => bail!("unsupported channels: {channels}"),
     }
 }
 
@@ -107,4 +124,3 @@ impl LinearResampler {
         out
     }
 }
-
