@@ -1,0 +1,4 @@
+## Minimal checksums for sherpa-onnx v1.12.20 archives used by rcat-voice.
+## (We only ship the targets we build/test on: Windows x64 + Linux x64 shared.)
+sherpa-onnx-v1.12.20-win-x64-shared.tar.bz2	2aa9c11f13d6a20308afedcaa8c04a678a1aaebc206b7609e4df7d7910582f56
+sherpa-onnx-v1.12.20-linux-x64-shared.tar.bz2	13a2c502f5ef373f514a5fc5c5ad03cc0798dcb564a6f8cbd54f8f6ce9e47462

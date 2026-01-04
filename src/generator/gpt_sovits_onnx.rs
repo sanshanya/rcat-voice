@@ -436,15 +436,15 @@ impl TtsEngine for GptSovitsOnnxTts {
             }
 
             let gen_done_ts = Instant::now();
-            Ok::<SynthesizedAudio, anyhow::Error>(SynthesizedAudio {
+            Ok::<Option<SynthesizedAudio>, anyhow::Error>(Some(SynthesizedAudio {
                 samples,
                 start_ts,
                 gen_done_ts,
-            })
+            }))
         })
         .await??;
 
-        Ok(Some(audio))
+        Ok(audio)
     }
 
     async fn play_samples(&self, audio: SynthesizedAudio) -> Result<Option<TtsMetrics>> {

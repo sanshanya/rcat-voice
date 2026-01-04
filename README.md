@@ -107,6 +107,47 @@ GSV_ONNX_MODEL_DIR=onnx \
 cargo run --example stream_sim --features gpt-sovits-onnx
 ```
 
+## 快速开始（ASR：Sherpa-ONNX / Paraformer）
+
+当前 ASR 以 `sherpa-rs` 为基础，实现 **Paraformer(离线) / SenseVoice(离线) + Silero VAD(分段)** 的流式识别（按 VAD 端点输出分段结果）。本地 CPU 场景默认推荐 Paraformer（更轻量）。
+
+1) 下载模型到 `models/`（与 `Cargo.toml` 同级，或通过 `ASR_MODELS_ROOT` 指定）：
+
+- `models/silero_vad.onnx`（或 `models/silero_vad/silero_vad.onnx`）
+- `models/sherpa-onnx-paraformer-zh-small-2024-03-09/`
+  - `model.int8.onnx`
+  - `tokens.txt`
+
+（可选）也可以使用：
+
+- `models/sherpa-onnx-paraformer-zh-2024-03-09/`
+  - `model.onnx`（或 `model.int8.onnx`）
+  - `tokens.txt`
+- `models/sherpa-onnx-paraformer-trilingual-zh-cantonese-en/`
+  - `model.onnx`（或 `model.int8.onnx`）
+  - `tokens.txt`
+- `models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/`
+  - `model.onnx`（或 `model.int8.onnx`）
+  - `tokens.txt`
+- `models/sherpa-onnx-sense-voice-funasr-nano-int8-2025-12-17/`（FunASR-Nano，推荐）
+  - `model.int8.onnx`
+  - `tokens.txt`
+- `models/sherpa-onnx-sense-voice-funasr-nano-2025-12-17/`（FunASR-Nano FP32）
+  - `model.onnx`
+  - `tokens.txt`
+
+对应下载链接（`asr-models`）：
+- `https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-funasr-nano-int8-2025-12-17.tar.bz2`
+- `https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-funasr-nano-2025-12-17.tar.bz2`
+
+2) 运行文件识别示例：
+
+```bash
+ASR_MODELS_ROOT=models \
+ASR_MODEL=paraformer-zh-small \
+cargo run --example asr_file --features asr-sherpa -- path/to/audio.wav
+```
+
 ## 编译与后端选择
 
 后端选择在运行时通过环境变量控制（`TTS_BACKEND`、`AUDIO_BACKEND`）。
@@ -155,6 +196,7 @@ cargo run --example terminal_chat --features gpt-sovits
 - `src/pipeline.rs`：TTS 调度与播放指标
 - `src/generator/`：TTS 后端（`gpt-sovits` / `gpt-sovits-onnx` / `os` / `remote` 占位）
 - `src/audio/`：音频后端（`rodio` / `wasapi` 占位 / `system` 占位）
+- `src/asr/`：ASR（目前：`asr-sherpa` / SenseVoice + Silero VAD）
 
 更详细的架构说明见 `docs/ARCHITECTURE.md`。
 
@@ -226,9 +268,35 @@ cargo run --example terminal_chat --features gpt-sovits
 - `GSV_ONNX_G2P_EN_PATH`：可选，自定义 `g2p_en/` 目录（需含 `encoder_model.onnx` / `decoder_model.onnx`）
 - `GSV_ONNX_SV_PATH`：可选，自定义 `sv.onnx` 路径
 
+### ASR（sherpa-rs）
+
+- `ASR_MODELS_ROOT`：模型根目录（默认 `models`）
+- `ASR_MODEL`：`paraformer-zh-small` | `paraformer-zh` | `paraformer-zh-int8` | `paraformer-trilingual` | `paraformer-en` | `sensevoice` | `sensevoice-int8` | `funasr-nano` | `funasr-nano-int8`（默认 `paraformer-zh-small`）
+- `ASR_MODEL_DTYPE`：`auto` | `int8` | `fp32`（默认 `auto`；Paraformer 目录同时存在 `model.int8.onnx`/`model.onnx` 时可用来强制选择）
+- `ASR_LANG`：`zh` | `en` | `ja` | `ko` | `yue` | `auto`（默认 `zh`）
+- `ASR_PROVIDER`：`cpu`（默认 `cpu`；后续可扩展 `cuda/directml`）
+- `ASR_THREADS`：推理线程数（默认 `2`）
+- `ASR_VAD_PATH`：VAD 模型路径（可选；默认尝试 `models/silero_vad.onnx` 或 `models/silero_vad/silero_vad.onnx`）
+- `ASR_VAD_CHUNK_MS`：内部喂给 VAD 的 chunk 毫秒数（默认 `20`；即使 `ASR_FEED_MS=0` 也会按该值分块，避免 reshape/空帧问题）
+- `ASR_INFER_LOG=1`：打印每个分段的推理耗时（ms）
+- `ASR_VAD_MIN_SILENCE`：端点最小静音秒数（默认 `0.25`）
+- `ASR_VAD_MIN_SPEECH`：最小语音段秒数（默认 `0.1`）
+- `ASR_VAD_MAX_SPEECH`：最大语音段秒数（默认 `30`）
+- `ASR_VAD_THRESHOLD`：VAD 阈值（默认 `0.5`）
+- `ASR_VAD_WINDOW`：VAD window size（默认 `512`）
+- `ASR_VAD_BUFFER_SECONDS`：VAD 环形缓冲秒数（默认 `100`）
+
 ### 示例（stream_sim）
 
 - `STREAM_SIM_DRAIN_MS`：发送结束后等待播放完成的最长时长（默认 10000）
+
+### 示例（asr_file）
+
+- `ASR_WAV`：wav 路径（也可用命令行第 1 个参数）
+- `ASR_FEED_MS`：每次喂给 ASR 的 chunk 时长（默认 20；设为 0 表示一次性喂入）
+- `ASR_METRICS=1`：打印时延/RTF 统计与每段 lag
+- `ASR_REF_FILE`：参考文本文件路径（可选，用于计算 CER）
+- `ASR_REF_TEXT`：参考文本（可选，用于计算 CER）
 
 ### 主程序（内置模拟流，仅用于本地验证）
 

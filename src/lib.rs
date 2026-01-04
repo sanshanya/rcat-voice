@@ -17,6 +17,7 @@
 //! ```
 
 pub mod audio;
+pub mod asr;
 pub mod generator;
 pub mod pipeline;
 pub mod streaming;
@@ -24,6 +25,9 @@ pub mod tokenizer;
 
 pub mod prelude {
     pub use crate::audio::{AudioBackend, AudioBackendKind, AudioConfig, RodioConfig};
+    pub use crate::asr::AsrSegment;
+    #[cfg(feature = "asr-sherpa")]
+    pub use crate::asr::{SherpaAsrConfig, SherpaAsrModel, SherpaAsrStream, SherpaVadConfig};
     pub use crate::generator::{
         SynthesizedAudio, TtsBackend, TtsEngine, TtsEngineBuilder, TtsMetrics,
     };

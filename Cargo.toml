@@ -20,6 +20,9 @@ wav_io = { version = "0.1.14", optional = true }
 jieba-rs = { version = "0.8", optional = true }
 # Optional: GPT-SoVITS ONNX (CPU) backend
 gpt_sovits_onnx_rs = { package = "gpt-sovits-onnx-rs", git = "https://github.com/null-define/gpt-sovits-onnx-rs", rev = "01d76cf190e04ce681b4dae6104ce1b3baee2ab7", optional = true }
+# Optional: ASR (Sherpa-ONNX via sherpa-rs)
+# Vendored so we can track newer sherpa-onnx C-API for newer models (e.g. FunASR-Nano).
+sherpa-rs = { path = "vendor/sherpa-rs/sherpa-rs", default-features = false, features = ["download-binaries"], optional = true }
 
 [features]
 default = []
@@ -27,8 +30,10 @@ gpt-sovits = ["dep:gpt_sovits_rs", "dep:wav_io", "tokenizer-jieba", "audio-rodio
 gpt-sovits-onnx = ["dep:gpt_sovits_onnx_rs", "audio-rodio"]
 audio-rodio = ["dep:rodio"]
 tokenizer-jieba = ["dep:jieba-rs"]
+asr-sherpa = ["dep:sherpa-rs"]
 
 [dev-dependencies]
 async-openai = { version = "0.32.2", features = ["byot", "chat-completion", "native-tls"] }
 serde_json = "1"
 futures = "0.3"
+hound = "3.5.1"

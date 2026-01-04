@@ -125,8 +125,15 @@ impl TtsEngineBuilder {
 }
 
 pub fn build_from_env() -> Result<Arc<dyn TtsEngine>> {
-    let backend = std::env::var("TTS_BACKEND")
-        .unwrap_or_else(|_| default_backend().to_string())
+    let backend_raw =
+        std::env::var("TTS_BACKEND").unwrap_or_else(|_| default_backend().to_string());
+    // Allow values like `tts_backend=gpt-sovits-onnx` (e.g. copied from config snippets)
+    // by taking the segment after the last '='.
+    let backend = backend_raw
+        .trim()
+        .rsplit_once('=')
+        .map(|(_, v)| v)
+        .unwrap_or(backend_raw.trim())
         .to_lowercase();
     match backend.as_str() {
         "os" => Ok(Arc::new(OsTts::new())),
