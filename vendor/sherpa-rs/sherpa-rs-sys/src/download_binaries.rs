@@ -91,11 +91,20 @@ lazy_static::lazy_static! {
     pub static ref DIST_CHECKSUM: HashMap<String, String> = {
         DIST_CHECKSUM_CONTENT
             .lines()
-            .map(|line| {
+            .filter_map(|line| {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    return None;
+                }
                 let mut parts = line.split_whitespace();
-                let key = parts.next().unwrap().to_string();
-                let value = parts.next().unwrap().to_string();
-                (key, value)
+                let Some(key) = parts.next() else {
+                    return None;
+                };
+                let Some(value) = parts.next() else {
+                    debug_log!("Ignoring malformed checksum line: {:?}", line);
+                    return None;
+                };
+                Some((key.to_string(), value.to_string()))
             })
             .collect()
     };

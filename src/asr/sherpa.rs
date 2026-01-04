@@ -10,6 +10,7 @@ use tokio::sync::mpsc;
 use tracing::info;
 
 const DEFAULT_MODELS_ROOT: &str = "models";
+const FALLBACK_MODELS_ROOT: &str = "asrmodel";
 const DEFAULT_MODEL: &str = "paraformer-zh-small-2024-03-09";
 const DEFAULT_LANG: &str = "zh";
 const DEFAULT_PROVIDER: &str = "cpu";
@@ -53,6 +54,9 @@ impl SherpaAsrModel {
     fn parse(raw: &str) -> Result<Self> {
         let mut key = raw.trim().to_lowercase();
         if let Some((_, tail)) = key.rsplit_once('/') {
+            key = tail.to_string();
+        }
+        if let Some((_, tail)) = key.rsplit_once('\\') {
             key = tail.to_string();
         }
         if let Some(tail) = key.strip_prefix("sherpa-onnx-") {
@@ -182,8 +186,16 @@ pub struct SherpaAsrConfig {
 impl SherpaAsrConfig {
     pub fn from_env() -> Result<Self> {
         let models_root = std::env::var("ASR_MODELS_ROOT")
-            .unwrap_or_else(|_| DEFAULT_MODELS_ROOT.to_string());
-        let models_root = PathBuf::from(models_root);
+            .ok()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                let fallback = PathBuf::from(FALLBACK_MODELS_ROOT);
+                if fallback.exists() {
+                    fallback
+                } else {
+                    PathBuf::from(DEFAULT_MODELS_ROOT)
+                }
+            });
 
         let model = std::env::var("ASR_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
         let model = SherpaAsrModel::parse(&model)?;
@@ -504,7 +516,7 @@ impl SherpaAsrStream {
                             continue;
                         }
                         if samples.len() <= vad_chunk_samples {
-                            vad.accept_waveform(samples);
+                            vad.accept_waveform(&samples);
                             if process_vad_segments(
                                 &mut vad,
                                 &recognizer,
@@ -518,7 +530,7 @@ impl SherpaAsrStream {
                             }
                         } else {
                             for chunk in samples.chunks(vad_chunk_samples) {
-                                vad.accept_waveform(chunk.to_vec());
+                                vad.accept_waveform(chunk);
                                 if process_vad_segments(
                                     &mut vad,
                                     &recognizer,
@@ -660,8 +672,9 @@ async fn process_vad_segments(
             continue;
         }
 
-        let start = segment.start as f32 / TARGET_SAMPLE_RATE as f32;
-        let end = (segment.start as usize + segment.samples.len()) as f32 / TARGET_SAMPLE_RATE as f32;
+        let start_samples = segment.start.max(0) as usize;
+        let start = start_samples as f32 / TARGET_SAMPLE_RATE as f32;
+        let end = (start_samples + segment.samples.len()) as f32 / TARGET_SAMPLE_RATE as f32;
         let samples = segment.samples;
         let recognizer = recognizer.clone();
 

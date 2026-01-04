@@ -111,10 +111,12 @@ cargo run --example stream_sim --features gpt-sovits-onnx
 
 当前 ASR 以 `sherpa-rs` 为基础，实现 **Paraformer(离线) / SenseVoice(离线) + Silero VAD(分段)** 的流式识别（按 VAD 端点输出分段结果）。本地 CPU 场景默认推荐 Paraformer（更轻量）。
 
-1) 下载模型到 `models/`（与 `Cargo.toml` 同级，或通过 `ASR_MODELS_ROOT` 指定）：
+1) 下载模型到 `asrmodel/` 或 `models/`（与 `Cargo.toml` 同级，或通过 `ASR_MODELS_ROOT` 指定）。
 
-- `models/silero_vad.onnx`（或 `models/silero_vad/silero_vad.onnx`）
-- `models/sherpa-onnx-paraformer-zh-small-2024-03-09/`
+默认行为：如果检测到 `asrmodel/` 存在且未设置 `ASR_MODELS_ROOT`，会优先使用 `asrmodel/`；否则使用 `models/`。
+
+- `<ASR_MODELS_ROOT>/silero_vad.onnx`（或 `<ASR_MODELS_ROOT>/silero_vad/silero_vad.onnx`）
+- `<ASR_MODELS_ROOT>/sherpa-onnx-paraformer-zh-small-2024-03-09/`
   - `model.int8.onnx`
   - `tokens.txt`
 
@@ -145,6 +147,16 @@ cargo run --example stream_sim --features gpt-sovits-onnx
 ```bash
 ASR_MODELS_ROOT=models \
 ASR_MODEL=paraformer-zh-small \
+cargo run --example asr_file --features asr-sherpa -- path/to/audio.wav
+```
+
+使用 FunASR Nano（推荐）：
+
+```bash
+ASR_MODELS_ROOT=asrmodel \
+ASR_MODEL=funasr-nano-int8 \
+ASR_INFER_LOG=1 \
+ASR_METRICS=1 \
 cargo run --example asr_file --features asr-sherpa -- path/to/audio.wav
 ```
 
@@ -270,13 +282,13 @@ cargo run --example terminal_chat --features gpt-sovits
 
 ### ASR（sherpa-rs）
 
-- `ASR_MODELS_ROOT`：模型根目录（默认 `models`）
+- `ASR_MODELS_ROOT`：模型根目录（默认：若存在 `asrmodel/` 则为 `asrmodel`，否则为 `models`）
 - `ASR_MODEL`：`paraformer-zh-small` | `paraformer-zh` | `paraformer-zh-int8` | `paraformer-trilingual` | `paraformer-en` | `sensevoice` | `sensevoice-int8` | `funasr-nano` | `funasr-nano-int8`（默认 `paraformer-zh-small`）
 - `ASR_MODEL_DTYPE`：`auto` | `int8` | `fp32`（默认 `auto`；Paraformer 目录同时存在 `model.int8.onnx`/`model.onnx` 时可用来强制选择）
 - `ASR_LANG`：`zh` | `en` | `ja` | `ko` | `yue` | `auto`（默认 `zh`）
 - `ASR_PROVIDER`：`cpu`（默认 `cpu`；后续可扩展 `cuda/directml`）
 - `ASR_THREADS`：推理线程数（默认 `2`）
-- `ASR_VAD_PATH`：VAD 模型路径（可选；默认尝试 `models/silero_vad.onnx` 或 `models/silero_vad/silero_vad.onnx`）
+- `ASR_VAD_PATH`：VAD 模型路径（可选；默认尝试 `<ASR_MODELS_ROOT>/silero_vad.onnx` 或 `<ASR_MODELS_ROOT>/silero_vad/silero_vad.onnx`）
 - `ASR_VAD_CHUNK_MS`：内部喂给 VAD 的 chunk 毫秒数（默认 `20`；即使 `ASR_FEED_MS=0` 也会按该值分块，避免 reshape/空帧问题）
 - `ASR_INFER_LOG=1`：打印每个分段的推理耗时（ms）
 - `ASR_VAD_MIN_SILENCE`：端点最小静音秒数（默认 `0.25`）
@@ -320,3 +332,11 @@ cargo run --example terminal_chat --features gpt-sovits
 - GPT-SoVITS ONNX 后端基于 ONNX Runtime，CPU 推理，参考音频需为单声道 16-bit PCM。
 - `StreamControl::pause()` 是中断行为，不提供恢复；需要重新发起流或新建会话。
 - Rodio 后端使用 `crossbeam-queue` 实现无锁缓冲。
+
+## 维护说明（vendored sherpa-rs）
+
+`asr-sherpa` 使用了 vendored 的 `vendor/sherpa-rs/`，目的是在上游 crate 尚未覆盖/验证最新模型与 C-API 版本时，确保我们可以稳定 pin 住 `sherpa-onnx` C-API 与下载产物。
+
+一旦 `sherpa-rs` 上游 bindings 更新并满足我们需求，优先切回官方依赖（减少维护成本）。如果我们后续改动变多，建议把 vendored 目录改为 git submodule / fork 分支，并考虑向上游提 PR。
+
+详见：`vendor/sherpa-rs/UPSTREAM.md`

@@ -112,8 +112,8 @@ impl SileroVad {
         }
     }
 
-    pub fn accept_waveform(&mut self, mut samples: Vec<f32>) {
-        let samples_ptr = samples.as_mut_ptr();
+    pub fn accept_waveform(&mut self, samples: &[f32]) {
+        let samples_ptr = samples.as_ptr();
         let samples_length = samples.len();
         unsafe {
             sherpa_rs_sys::SherpaOnnxVoiceActivityDetectorAcceptWaveform(

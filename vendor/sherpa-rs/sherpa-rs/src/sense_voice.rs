@@ -41,6 +41,8 @@ impl SenseVoiceRecognizer {
         let provider_ptr = cstring_from_str(&provider);
         let num_threads = config.num_threads.unwrap_or(1);
 
+        let decoding_method_ptr = cstring_from_str("greedy_search");
+
         // SenseVoice specific config
         let model_ptr = cstring_from_str(&config.model);
         let language_ptr = cstring_from_str(&config.language);
@@ -84,7 +86,7 @@ impl SenseVoiceRecognizer {
         // Recognizer config
         let config = unsafe {
             sherpa_rs_sys::SherpaOnnxOfflineRecognizerConfig {
-                decoding_method: mem::zeroed::<_>(),
+                decoding_method: decoding_method_ptr.as_ptr(),
                 feat_config: sherpa_rs_sys::SherpaOnnxFeatureConfig {
                     sample_rate: 16000,
                     feature_dim: 80,
