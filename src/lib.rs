@@ -23,12 +23,13 @@ pub mod pipeline;
 pub mod streaming;
 pub mod tokenizer;
 pub mod turn;
+mod internal;
 
 pub mod prelude {
     pub use crate::audio::{AudioBackend, AudioBackendKind, AudioConfig, RodioConfig};
     pub use crate::asr::AsrSegment;
     #[cfg(feature = "asr-sherpa")]
-    pub use crate::asr::{SherpaAsrConfig, SherpaAsrModel, SherpaAsrStream, SherpaVadConfig};
+    pub use crate::asr::{AsrModelDtype, SherpaAsrConfig, SherpaAsrModel, SherpaAsrStream, SherpaVadConfig};
     pub use crate::generator::{
         SynthesizedAudio, TtsBackend, TtsEngine, TtsEngineBuilder, TtsMetrics,
     };

@@ -53,6 +53,20 @@ async fn main() -> anyhow::Result<()> {
 - `StreamConfig`
 - `GptSovitsConfig` / `GptSovitsOnnxConfig`
 
+### Tokenizer 调参（无需重新编译）
+
+分段阈值支持环境变量覆盖（单位：字符数；会自动归一化到 `min <= soft_max <= hard_max`，并 clamp 到 1–400）：
+
+- Eager（默认 `2/6/12`）：`TOKENIZER_EAGER_MIN_CHARS` / `TOKENIZER_EAGER_SOFT_MAX_CHARS` / `TOKENIZER_EAGER_HARD_MAX_CHARS`
+- Normal（默认 `10/20/40`）：`TOKENIZER_NORMAL_MIN_CHARS` / `TOKENIZER_NORMAL_SOFT_MAX_CHARS` / `TOKENIZER_NORMAL_HARD_MAX_CHARS`
+- Relax（默认 `20/35/80`）：`TOKENIZER_RELAX_MIN_CHARS` / `TOKENIZER_RELAX_SOFT_MAX_CHARS` / `TOKENIZER_RELAX_HARD_MAX_CHARS`
+
+其它相关参数：
+
+- `TOKENIZER_EAGER_CHUNKS`（兼容旧名：`CHUNKER_EAGER_CHUNKS`）
+- `TOKENIZER_RELAX_BUFFER_MS`（缓冲达到该值后进入 Relax）
+- `TOKENIZER_RELAX_LOG=1`（打印 Relax on/off）
+
 ## 快速开始（Windows + CUDA GPT-SoVITS）
 
 1) 安装 Rust（MSVC 工具链）。
@@ -81,6 +95,11 @@ $env:LIBTORCH_BYPASS_VERSION_CHECK="1"   # 可选：若 torch-sys 报 PyTorch �
 cargo run --example stream_sim --features gpt-sovits
 ```
 
+可选：开启文本/流式推理指标日志（如 `next_chunk first return time`）：
+
+- PowerShell：`$env:GSV_TEXT_METRICS="1"`
+- bash：`GSV_TEXT_METRICS=1 cargo run --example stream_sim --features gpt-sovits`
+
 ## 快速开始（CPU ONNX GPT-SoVITS）
 
 1) 按 `gpt-sovits-onnx-rs` 的 `scripts/README.md` 转换模型，得到 ONNX 模型目录。
@@ -105,6 +124,14 @@ cargo run --example stream_sim --features gpt-sovits
 ```bash
 TTS_BACKEND=gpt-sovits-onnx \
 GSV_ONNX_MODEL_DIR=onnx \
+cargo run --example stream_sim --features gpt-sovits-onnx
+```
+
+PowerShell：
+
+```powershell
+$env:TTS_BACKEND="gpt-sovits-onnx"
+$env:GSV_ONNX_MODEL_DIR="onnx"
 cargo run --example stream_sim --features gpt-sovits-onnx
 ```
 
@@ -140,6 +167,7 @@ cargo run --example stream_sim --features gpt-sovits-onnx
   - `tokens.txt`
 
 对应下载链接（`asr-models`）：
+
 - `https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-funasr-nano-int8-2025-12-17.tar.bz2`
 - `https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-funasr-nano-2025-12-17.tar.bz2`
 
@@ -258,6 +286,19 @@ $env:AUDIO_CHANNELS="1"
 cargo run --example voice_assistant --features asr-sherpa,asr-mic,turn-smart,gpt-sovits --release
 ```
 
+使用 CPU ONNX GPT-SoVITS（无需 CUDA）：
+
+```powershell
+$env:TTS_BACKEND="gpt-sovits-onnx"
+$env:GSV_ONNX_MODEL_DIR="onnx"
+$env:GSV_ONNX_EXPORT_NAME="custom"        # 可选：与导出前缀一致
+$env:AUDIO_BACKEND="rodio"
+$env:AUDIO_SAMPLE_RATE="32000"
+$env:AUDIO_CHANNELS="1"
+
+cargo run --example voice_assistant --features asr-sherpa,asr-mic,turn-smart,gpt-sovits-onnx --release
+```
+
 如需运行时切换后端，编译时可改用 `--all-features`。
 使用 ONNX 后端时，将特性替换为 `gpt-sovits-onnx` 并设置 `TTS_BACKEND=gpt-sovits-onnx`。
 
@@ -278,12 +319,16 @@ cargo run --example voice_assistant --features asr-sherpa,asr-mic,turn-smart,gpt
 
 以下环境变量仅影响 `*_from_env` / `StreamSession::from_env` / `build_from_env` 相关路径；显式配置不会依赖环境变量。
 
+> Windows PowerShell 设置环境变量请用 `$env:KEY="value"`；`$KEY="value"` 只是 PowerShell 变量，不会传给 `cargo run`。
+
 ### 核心
 
 - `TTS_BACKEND`：`gpt-sovits` | `gpt-sovits-onnx` | `os` | `remote`
   - 默认：Windows + 启用 `gpt-sovits` 特性时为 `gpt-sovits`，否则 `os`
 - `TTS_PARALLEL_SYNTH`：`1`/`0`（默认 `1`；支持的后端会先合成再排队播放）
 - `TTS_SYNTH_INFLIGHT`：并行合成的最大任务数（默认 `1`，可适当调大）
+- `TTS_BACKLOG_LIMIT`：并行合成的排队上限（默认 `32`；满则对上游施加背压）
+- `TTS_SYNTH_TIMEOUT_MS`：单段合成超时（默认 `30000`；`0`=关闭；超时会跳过该段以避免卡死）
 - `AUDIO_BACKEND`：`rodio`（默认）
 
 ### Audio（rodio）
@@ -296,15 +341,12 @@ cargo run --example voice_assistant --features asr-sherpa,asr-mic,turn-smart,gpt
 
 ### 分段器
 
-- `CHUNKER_EAGER_CHUNKS`：首段短切数量（默认 2）
-- `TOKENIZER_MIN_CHARS`：最小字符数（默认 20）
-- `TOKENIZER_MAX_CHARS`：常规最大字符数（默认 50）
-- `TOKENIZER_BOUNDARY_OVERFLOW`：等待边界的额外字符数（默认 20）
+- `TOKENIZER_EAGER_CHUNKS`：eager 段数量（默认 1；兼容旧名：`CHUNKER_EAGER_CHUNKS`）
+- 阈值可通过环境变量覆盖（单位：字符数；会自动归一化到 `min <= soft_max <= hard_max`，并 clamp 到 1–400）：
+  - Eager（默认 `2/6/12`）：`TOKENIZER_EAGER_MIN_CHARS` / `TOKENIZER_EAGER_SOFT_MAX_CHARS` / `TOKENIZER_EAGER_HARD_MAX_CHARS`
+  - Normal（默认 `10/20/40`）：`TOKENIZER_NORMAL_MIN_CHARS` / `TOKENIZER_NORMAL_SOFT_MAX_CHARS` / `TOKENIZER_NORMAL_HARD_MAX_CHARS`
+  - Relax（默认 `20/35/80`）：`TOKENIZER_RELAX_MIN_CHARS` / `TOKENIZER_RELAX_SOFT_MAX_CHARS` / `TOKENIZER_RELAX_HARD_MAX_CHARS`
 - `TOKENIZER_RELAX_BUFFER_MS`：缓存水位达到该值后放松分段（默认 200）
-- `TOKENIZER_RELAX_SCALE`：放松倍率（默认 1.5）
-- 说明：`relaxed_max = TOKENIZER_MAX_CHARS * TOKENIZER_RELAX_SCALE`，上限为 120
-- `TOKENIZER_RELAX_BOUNDARY_WINDOW`：优先边界窗口（默认 24）
-- `TOKENIZER_RELAX_OVERFLOW`：放松模式下的额外超出（默认 30）
 - `TOKENIZER_RELAX_LOG=1`：打印放松状态切换日志
 
 放松分段依赖 `buffered_ms()` 水位（目前仅 `rodio` 支持）。
@@ -350,6 +392,7 @@ cargo run --example voice_assistant --features asr-sherpa,asr-mic,turn-smart,gpt
 - `ASR_LANG`：`zh` | `en` | `ja` | `ko` | `yue` | `auto`（默认 `zh`）
 - `ASR_PROVIDER`：`cpu`（默认 `cpu`；后续可扩展 `cuda/directml`）
 - `ASR_THREADS`：推理线程数（默认 `2`）
+- `ASR_SEGMENT_QUEUE`：VAD 分段等待推理的队列大小（默认 `8`；满则丢弃新分段）
 - `ASR_VAD_PATH`：VAD 模型路径（可选；默认尝试 `<ASR_MODELS_ROOT>/silero_vad.onnx` 或 `<ASR_MODELS_ROOT>/silero_vad/silero_vad.onnx`）
 - `ASR_VAD_CHUNK_MS`：内部喂给 VAD 的 chunk 毫秒数（默认 `20`；即使 `ASR_FEED_MS=0` 也会按该值分块，避免 reshape/空帧问题）
 - `ASR_INFER_LOG=1`：打印每个分段的推理耗时（ms）
@@ -363,8 +406,18 @@ cargo run --example voice_assistant --features asr-sherpa,asr-mic,turn-smart,gpt
 ### Turn detection（Smart Turn）
 
 - 特性：`turn-smart`
-- `SMART_TURN_MODEL`：Smart Turn ONNX 模型路径（必填；输入 16kHz mono，窗口固定 8s）
+- `SMART_TURN_MODEL`：Smart Turn ONNX 模型路径（或包含 smart-turn*.onnx 的目录；可选，不设置则禁用；输入 16kHz mono，窗口固定 8s）
 - `SMART_TURN_THRESHOLD`：端点阈值（默认 `0.5`，范围 `0.0-1.0`）
+- `SMART_TURN_MIN_SILENCE_MS`：触发 Smart Turn 的最小静音时长（`voice_assistant` 示例；默认 `400`）
+- `SMART_TURN_COMMIT_MS`：端点确认窗口（`voice_assistant` 示例；默认 `300`）
+- `SMART_TURN_FORCE_END_MS`：静音超过该值则强制结束 turn（`voice_assistant` 示例；默认 `2000`）
+- `SMART_TURN_EVAL_INTERVAL_MS`：静音期间推理间隔（`voice_assistant` 示例；默认 `200`）
+- `SMART_TURN_SILENCE_ABS`：静音判定阈值（`voice_assistant` 示例；默认 `200`）
+
+### Barge-in（voice_assistant）
+
+- `BARGE_IN_MIN_SPEECH_MS`：连续说话达到该值才触发打断（默认 `450`）
+- `BARGE_IN_SILENCE_ABS`：静音判定阈值（默认继承 `SMART_TURN_SILENCE_ABS`，未设置时为 `200`）
 
 ### 示例（stream_sim）
 
@@ -393,7 +446,7 @@ cargo run --example voice_assistant --features asr-sherpa,asr-mic,turn-smart,gpt
 - `LLM_SIM_DELAY_MS`：发送间隔（默认 80）
 - `AUTO_CANCEL_DELAY_MS`：第 3 轮自动取消（默认 1500）
 
-说明：以上仅作用于 `cargo run` 的内置模拟流。真实对话请使用 examples。 
+说明：以上仅作用于 `cargo run` 的内置模拟流。真实对话请使用 examples。
 
 ### LLM 示例
 
@@ -405,7 +458,7 @@ cargo run --example voice_assistant --features asr-sherpa,asr-mic,turn-smart,gpt
 
 - GPT-SoVITS 后端仅支持 Windows + CUDA LibTorch。
 - GPT-SoVITS ONNX 后端基于 ONNX Runtime，CPU 推理，参考音频需为单声道 16-bit PCM。
-- `StreamControl::pause()` 是中断行为，不提供恢复；需要重新发起流或新建会话。
+- `StreamControl::interrupt()` 是“打断当前轮次”的行为，不提供恢复；需要重新发起流或新建会话。
 - Rodio 后端使用 `crossbeam-queue` 实现无锁缓冲。
 
 ## 维护说明（vendored sherpa-rs）

@@ -1,4 +1,4 @@
-use crate::audio::{AudioBackend, CancelToken};
+use crate::audio::{AudioBackend, CancelScope, CancelToken, SegmentWriter};
 use super::{Result, SynthesizedAudio, TtsEngine, TtsMetrics};
 use anyhow::anyhow;
 use async_trait::async_trait;
@@ -6,12 +6,14 @@ use gpt_sovits_rs::gsv;
 use gpt_sovits_rs::tch;
 use gpt_sovits_rs::text::G2PConfig;
 use jieba_rs::Jieba;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::time::Instant;
 use tracing::info;
+
+use crate::internal::{env, model_locator, timing};
 
 // 首段之后的默认流式分块 token 目标（逐步增大以提升连贯性/吞吐）：
 // 25：第二段初始块，更快出声
@@ -54,29 +56,16 @@ impl Default for GptSovitsChunkPolicy {
 impl GptSovitsChunkPolicy {
     pub fn from_env() -> Self {
         let mut cfg = Self::default();
-        if let Ok(value) = std::env::var("GSV_FIRST_CHUNK_DYNAMIC") {
-            cfg.dynamic = value != "0";
+        cfg.dynamic = env::bool01("GSV_FIRST_CHUNK_DYNAMIC", cfg.dynamic);
+        if let Some(parsed) = env::get::<usize>("GSV_FIRST_CHUNK_SHORT_CHARS") {
+            cfg.short_chars = parsed.clamp(1, 200);
         }
-        if let Ok(value) = std::env::var("GSV_FIRST_CHUNK_SHORT_CHARS") {
-            if let Ok(parsed) = value.parse::<usize>() {
-                cfg.short_chars = parsed.clamp(1, 200);
-            }
+        if let Some(parsed) = env::get::<usize>("GSV_FIRST_CHUNK_MID_CHARS") {
+            cfg.mid_chars = parsed.clamp(cfg.short_chars, 400);
         }
-        if let Ok(value) = std::env::var("GSV_FIRST_CHUNK_MID_CHARS") {
-            if let Ok(parsed) = value.parse::<usize>() {
-                cfg.mid_chars = parsed.clamp(cfg.short_chars, 400);
-            }
-        }
-        if let Ok(value) = std::env::var("GSV_FIRST_CHUNK_SHORT_TOKENS") {
-            if let Ok(parsed) = value.parse::<i64>() {
-                cfg.short_tokens = parsed.clamp(3, 25);
-            }
-        }
-        if let Ok(value) = std::env::var("GSV_FIRST_CHUNK_MID_TOKENS") {
-            if let Ok(parsed) = value.parse::<i64>() {
-                cfg.mid_tokens = parsed.clamp(3, 25);
-            }
-        }
+        cfg.short_tokens =
+            env::i64_clamped("GSV_FIRST_CHUNK_SHORT_TOKENS", cfg.short_tokens, 3, 25);
+        cfg.mid_tokens = env::i64_clamped("GSV_FIRST_CHUNK_MID_TOKENS", cfg.mid_tokens, 3, 25);
         cfg
     }
 }
@@ -199,34 +188,23 @@ fn build_inner(config: &GptSovitsConfig, device: tch::Device) -> Result<Inner> {
     })
 }
 
-fn first_existing(base_dir: &Path, label: &str, candidates: &[&str]) -> Result<PathBuf> {
-    for rel in candidates {
-        let p = base_dir.join(rel);
-        if p.exists() {
-            return Ok(p);
-        }
-    }
-    let tried = candidates
-        .iter()
-        .map(|c| format!("`{}`", base_dir.join(c).display()))
-        .collect::<Vec<_>>()
-        .join(", ");
-    Err(anyhow!("{label} not found (tried: {tried})").into())
-}
-
 impl GptSovitsConfig {
     pub fn from_dir(base_dir: impl Into<PathBuf>) -> Result<Self> {
         let base_dir: PathBuf = base_dir.into();
 
-        let g2p_en_path = first_existing(
+        let g2p_en_path = model_locator::first_existing_file_rel(
             &base_dir,
             "g2p_en model (mini-bart-g2p)",
             &["mini-bart-g2p.pt", "resource/mini-bart-g2p.pt"],
         )?;
-        let g2pw_path = first_existing(&base_dir, "g2pw model", &["g2pw_model.pt", "g2pw.pt"])?;
-        let cn_bert_path =
-            first_existing(&base_dir, "cn_bert model", &["bert_model.pt", "bert.pt"])?;
-        let ssl_model_path = first_existing(
+        let g2pw_path =
+            model_locator::first_existing_file_rel(&base_dir, "g2pw model", &["g2pw_model.pt", "g2pw.pt"])?;
+        let cn_bert_path = model_locator::first_existing_file_rel(
+            &base_dir,
+            "cn_bert model",
+            &["bert_model.pt", "bert.pt"],
+        )?;
+        let ssl_model_path = model_locator::first_existing_file_rel(
             &base_dir,
             "ssl model",
             &["ssl_model.pt", "ssl.pt", "resource/ssl_model.pt"],
@@ -238,7 +216,7 @@ impl GptSovitsConfig {
         } else if combined_path.exists() {
             combined_path.clone()
         } else {
-            first_existing(&base_dir, "t2s model", &["t2s.pt", "t2s.cpu.pt"])?
+            model_locator::first_existing_file_rel(&base_dir, "t2s model", &["t2s.pt", "t2s.cpu.pt"])?
         };
 
         let vits_model_path = if base_dir.join("vits.pt").exists() {
@@ -246,15 +224,15 @@ impl GptSovitsConfig {
         } else if combined_path.exists() {
             combined_path
         } else {
-            first_existing(&base_dir, "vits model", &["vits.pt", "vits.cpu.pt"])?
+            model_locator::first_existing_file_rel(&base_dir, "vits model", &["vits.pt", "vits.cpu.pt"])?
         };
 
-        let ref_wav_path = first_existing(
+        let ref_wav_path = model_locator::first_existing_file_rel(
             &base_dir,
             "ref.wav",
             &["ref.wav", "ref_32k.wav", "ref32k.wav"],
         )?;
-        let ref_text_path = first_existing(&base_dir, "ref.txt", &["ref.txt"])?;
+        let ref_text_path = model_locator::first_existing_file_rel(&base_dir, "ref.txt", &["ref.txt"])?;
         let ref_text = std::fs::read_to_string(&ref_text_path)?
             .trim_start_matches('\u{feff}')
             .trim()
@@ -285,57 +263,42 @@ impl GptSovitsConfig {
     }
 
     pub fn from_env() -> Result<Self> {
-        let base_dir = std::env::var("GSV_MODEL_DIR")
-            .unwrap_or_else(|_| DEFAULT_BASE_DIR.to_string());
+        let base_dir = env::string("GSV_MODEL_DIR").unwrap_or_else(|| DEFAULT_BASE_DIR.to_string());
         let mut cfg = Self::from_dir(base_dir)?;
         cfg.apply_env_overrides();
         Ok(cfg)
     }
 
     fn apply_env_overrides(&mut self) {
-        if let Ok(value) = std::env::var("GSV_TOP_K") {
-            if let Ok(parsed) = value.parse::<i64>() {
-                self.top_k = parsed.clamp(1, 50);
-            }
+        if let Some(parsed) = env::get::<i64>("GSV_TOP_K") {
+            self.top_k = parsed.clamp(1, 50);
         }
-        if let Ok(value) = std::env::var("GSV_FIRST_TOP_K") {
-            if let Ok(parsed) = value.parse::<i64>() {
-                self.top_k_first = parsed.clamp(1, self.top_k);
-            }
+        if let Some(parsed) = env::get::<i64>("GSV_FIRST_TOP_K") {
+            self.top_k_first = parsed.clamp(1, self.top_k);
         }
         if self.top_k_first != self.top_k {
             info!("First segment top_k: {} (default={})", self.top_k_first, self.top_k);
         }
 
-        if let Ok(value) = std::env::var("GSV_FIRST_CHUNK_TOKENS") {
-            if let Ok(parsed) = value.parse::<i64>() {
-                let first_chunk_tokens = parsed.clamp(3, 25);
-                if self.chunk_token_nums.is_empty() {
-                    self.chunk_token_nums = vec![first_chunk_tokens];
-                } else {
-                    self.chunk_token_nums[0] = first_chunk_tokens;
-                }
-                if first_chunk_tokens != 10 {
-                    info!("First chunk token target: {}", first_chunk_tokens);
-                }
+        if let Some(parsed) = env::get::<i64>("GSV_FIRST_CHUNK_TOKENS") {
+            let first_chunk_tokens = parsed.clamp(3, 25);
+            if self.chunk_token_nums.is_empty() {
+                self.chunk_token_nums = vec![first_chunk_tokens];
+            } else {
+                self.chunk_token_nums[0] = first_chunk_tokens;
+            }
+            if first_chunk_tokens != 10 {
+                info!("First chunk token target: {}", first_chunk_tokens);
             }
         }
 
-        if let Ok(value) = std::env::var("GSV_MAX_CUT_TOKEN") {
-            if let Ok(parsed) = value.parse::<i64>() {
-                self.max_cut_token = parsed.clamp(25, 1024);
-            }
-        }
+        self.max_cut_token = env::i64_clamped("GSV_MAX_CUT_TOKEN", self.max_cut_token, 25, 1024);
         if self.max_cut_token != 25 {
             info!("Max cut token: {}", self.max_cut_token);
         }
 
-        self.log_text_metrics = std::env::var("GSV_TEXT_METRICS")
-            .map(|v| v == "1")
-            .unwrap_or(false);
-        self.jieba_bench = std::env::var("GSV_JIEBA_BENCH")
-            .map(|v| v == "1")
-            .unwrap_or(false);
+        self.log_text_metrics = env::bool01("GSV_TEXT_METRICS", false);
+        self.jieba_bench = env::bool01("GSV_JIEBA_BENCH", false);
         if self.jieba_bench {
             info!("Jieba bench enabled (extra cut per chunk).");
         }
@@ -378,6 +341,152 @@ impl GptSovitsTts {
     }
 }
 
+trait ChunkSink {
+    fn on_chunk(&mut self, samples: &[f32], cancel: &CancelScope) -> Result<bool>;
+}
+
+struct PlaybackSink<'a> {
+    segment: &'a mut dyn SegmentWriter,
+    first_audio_ts: Option<Instant>,
+}
+
+impl<'a> PlaybackSink<'a> {
+    fn new(segment: &'a mut dyn SegmentWriter) -> Self {
+        Self {
+            segment,
+            first_audio_ts: None,
+        }
+    }
+}
+
+impl ChunkSink for PlaybackSink<'_> {
+    fn on_chunk(&mut self, samples: &[f32], cancel: &CancelScope) -> Result<bool> {
+        let written = self.segment.push(samples, cancel);
+        if written == 0 {
+            return Ok(false);
+        }
+        if self.first_audio_ts.is_none() {
+            self.first_audio_ts = self.segment.first_audio_ts();
+        }
+        Ok(true)
+    }
+}
+
+struct CollectSink {
+    samples: Vec<f32>,
+}
+
+impl CollectSink {
+    fn new() -> Self {
+        Self { samples: Vec::new() }
+    }
+}
+
+impl ChunkSink for CollectSink {
+    fn on_chunk(&mut self, samples: &[f32], _cancel: &CancelScope) -> Result<bool> {
+        self.samples.extend_from_slice(samples);
+        Ok(true)
+    }
+}
+
+fn run_stream_infer(
+    inner: &Inner,
+    text: &str,
+    is_first: bool,
+    cancel_scope: &CancelScope,
+    sink: &mut impl ChunkSink,
+) -> Result<()> {
+    let text_chars = text.chars().count();
+    if let Some(jieba) = inner.jieba.as_ref() {
+        let start = Instant::now();
+        let _ = jieba.cut(text, true);
+        let elapsed = start.elapsed();
+        info!("jieba cut time: {:?} | {} chars", elapsed, text_chars);
+    }
+
+    let (text_frontend, elapsed) = timing::time_if(inner.log_text_metrics, || {
+        gpt_sovits_rs::text::get_phone_and_bert(&inner.g2p, text)
+    });
+    let (text_seq, text_bert) = text_frontend?;
+    if let Some(elapsed) = elapsed {
+        info!("text frontend time: {:?} | {} chars", elapsed, text_chars);
+    }
+    let text_bert = if inner.fp16 { to_half(text_bert) } else { to_float(text_bert) };
+
+    let (prompts, refer, sv_emb) = (
+        inner.ref_params.0.shallow_clone(),
+        inner.ref_params.1.shallow_clone(),
+        inner.ref_params.2.shallow_clone(),
+    );
+
+    let ref_seq = inner.ref_seq.shallow_clone();
+    let ref_bert = inner.ref_bert.shallow_clone();
+    let top_k = if is_first {
+        inner.top_k_first
+    } else {
+        inner.top_k
+    };
+
+    let (stream_res, elapsed) = timing::time_if(inner.log_text_metrics, || {
+        inner.speaker.stream_infer(
+            (prompts, refer, sv_emb),
+            ref_seq,
+            text_seq,
+            ref_bert,
+            text_bert,
+            top_k,
+        )
+    });
+    let mut stream = stream_res?;
+    if let Some(elapsed) = elapsed {
+        info!("stream_infer init time: {:?}", elapsed);
+    }
+
+    let chunk_token_nums = dynamic_chunk_token_nums(
+        text_chars,
+        &inner.chunk_token_nums,
+        &inner.chunk_policy,
+        inner.log_text_metrics,
+    );
+    let mut first_chunk_gen_logged = false;
+    let mut first_chunk_io_logged = false;
+    while !cancel_scope.is_cancelled() {
+        let chunk_start =
+            (!first_chunk_gen_logged && inner.log_text_metrics).then_some(Instant::now());
+        let Some(audio) = stream.next_chunk(inner.max_cut_token, &chunk_token_nums)? else {
+            break;
+        };
+        if let Some(start) = chunk_start {
+            let elapsed = start.elapsed();
+            info!("next_chunk first return time: {:?}", elapsed);
+            first_chunk_gen_logged = true;
+        }
+
+        let audio = audio.contiguous();
+        let audio_size = audio.numel();
+        if audio_size == 0 {
+            continue;
+        }
+
+        let io_start =
+            (!first_chunk_io_logged && inner.log_text_metrics).then_some(Instant::now());
+        let audio_cpu = audio.f_to_device(tch::Device::Cpu)?.contiguous();
+        let mut samples = vec![0f32; audio_size];
+        audio_cpu.f_copy_data(&mut samples, audio_size)?;
+
+        let accepted = sink.on_chunk(&samples, cancel_scope)?;
+        if accepted {
+            if let Some(start) = io_start {
+                let elapsed = start.elapsed();
+                info!("first chunk cpu+append time: {:?}", elapsed);
+                first_chunk_io_logged = true;
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[async_trait]
 impl TtsEngine for GptSovitsTts {
     async fn speak(&self, text: &str) -> Result<TtsMetrics> {
@@ -389,7 +498,6 @@ impl TtsEngine for GptSovitsTts {
 
         let metrics = tokio::task::spawn_blocking(move || {
             let start_ts = Instant::now();
-            let mut first_audio_ts: Option<Instant> = None;
 
             let cancel_scope = cancel.scope();
 
@@ -401,116 +509,14 @@ impl TtsEngine for GptSovitsTts {
             let _g = tch::no_grad_guard();
             let mut segment = audio.begin_segment();
 
-            let text_chars = text.chars().count();
-            if let Some(jieba) = inner.jieba.as_ref() {
-                let start = Instant::now();
-                let _ = jieba.cut(&text, true);
-                let elapsed = start.elapsed();
-                info!("jieba cut time: {:?} | {} chars", elapsed, text_chars);
-            }
-
-            let text_front_start = if inner.log_text_metrics {
-                Some(Instant::now())
-            } else {
-                None
+            let first_audio_ts = {
+                let mut sink = PlaybackSink::new(segment.as_mut());
+                run_stream_infer(inner, &text, is_first, &cancel_scope, &mut sink)?;
+                sink.first_audio_ts
             };
-            let (text_seq, text_bert) =
-                gpt_sovits_rs::text::get_phone_and_bert(&inner.g2p, &text)?;
-            if let Some(start) = text_front_start {
-                let elapsed = start.elapsed();
-                info!("text frontend time: {:?} | {} chars", elapsed, text_chars);
-            }
-            let text_bert = if inner.fp16 { to_half(text_bert) } else { to_float(text_bert) };
-
-            let (prompts, refer, sv_emb) = (
-                inner.ref_params.0.shallow_clone(),
-                inner.ref_params.1.shallow_clone(),
-                inner.ref_params.2.shallow_clone(),
-            );
-
-            let ref_seq = inner.ref_seq.shallow_clone();
-            let ref_bert = inner.ref_bert.shallow_clone();
-            let top_k = if is_first {
-                inner.top_k_first
-            } else {
-                inner.top_k
-            };
-
-            let stream_infer_start = if inner.log_text_metrics {
-                Some(Instant::now())
-            } else {
-                None
-            };
-            let mut stream = inner.speaker.stream_infer(
-                (prompts, refer, sv_emb),
-                ref_seq,
-                text_seq,
-                ref_bert,
-                text_bert,
-                top_k,
-            )?;
-            if let Some(start) = stream_infer_start {
-                let elapsed = start.elapsed();
-                info!("stream_infer init time: {:?}", elapsed);
-            }
-
-            let chunk_token_nums = dynamic_chunk_token_nums(
-                text_chars,
-                &inner.chunk_token_nums,
-                &inner.chunk_policy,
-                inner.log_text_metrics,
-            );
-            let mut first_chunk_gen_logged = false;
-            let mut first_chunk_io_logged = false;
-            while !cancel_scope.is_cancelled() {
-                let chunk_start = if !first_chunk_gen_logged && inner.log_text_metrics {
-                    Some(Instant::now())
-                } else {
-                    None
-                };
-                let Some(audio) = stream.next_chunk(inner.max_cut_token, &chunk_token_nums)? else {
-                    break;
-                };
-                if let Some(start) = chunk_start {
-                    let elapsed = start.elapsed();
-                    info!("next_chunk first return time: {:?}", elapsed);
-                    first_chunk_gen_logged = true;
-                }
-
-                let audio = audio.contiguous();
-                let audio_size = audio.numel();
-                if audio_size == 0 {
-                    continue;
-                }
-
-                let io_start = if !first_chunk_io_logged && inner.log_text_metrics {
-                    Some(Instant::now())
-                } else {
-                    None
-                };
-                let audio_cpu = audio.f_to_device(tch::Device::Cpu)?.contiguous();
-                let mut samples = vec![0f32; audio_size];
-                audio_cpu.f_copy_data(&mut samples, audio_size)?;
-
-                let written = segment.push(&samples, &cancel_scope);
-                if written == 0 {
-                    continue;
-                }
-                if first_audio_ts.is_none() {
-                    first_audio_ts = segment.first_audio_ts();
-                }
-                if let Some(start) = io_start {
-                    let elapsed = start.elapsed();
-                    info!("first chunk cpu+append time: {:?}", elapsed);
-                    first_chunk_io_logged = true;
-                }
-            }
-
             let gen_done_ts = Instant::now();
             let playback = segment.finish(cancel_scope.is_cancelled());
-            if first_audio_ts.is_none() {
-                first_audio_ts = playback.first_audio_ts;
-            }
+            let first_audio_ts = first_audio_ts.or(playback.first_audio_ts);
             let play_done_ts = playback.play_done_ts;
             let play_done_rx = playback.play_done_rx;
 
@@ -557,109 +563,11 @@ impl TtsEngine for GptSovitsTts {
 
             let _g = tch::no_grad_guard();
 
-            let text_chars = text.chars().count();
-            if let Some(jieba) = inner.jieba.as_ref() {
-                let start = Instant::now();
-                let _ = jieba.cut(&text, true);
-                let elapsed = start.elapsed();
-                info!("jieba cut time: {:?} | {} chars", elapsed, text_chars);
-            }
-
-            let text_front_start = if inner.log_text_metrics {
-                Some(Instant::now())
-            } else {
-                None
-            };
-            let (text_seq, text_bert) =
-                gpt_sovits_rs::text::get_phone_and_bert(&inner.g2p, &text)?;
-            if let Some(start) = text_front_start {
-                let elapsed = start.elapsed();
-                info!("text frontend time: {:?} | {} chars", elapsed, text_chars);
-            }
-            let text_bert = if inner.fp16 { to_half(text_bert) } else { to_float(text_bert) };
-
-            let (prompts, refer, sv_emb) = (
-                inner.ref_params.0.shallow_clone(),
-                inner.ref_params.1.shallow_clone(),
-                inner.ref_params.2.shallow_clone(),
-            );
-
-            let ref_seq = inner.ref_seq.shallow_clone();
-            let ref_bert = inner.ref_bert.shallow_clone();
-            let top_k = if is_first {
-                inner.top_k_first
-            } else {
-                inner.top_k
-            };
-
-            let stream_infer_start = if inner.log_text_metrics {
-                Some(Instant::now())
-            } else {
-                None
-            };
-            let mut stream = inner.speaker.stream_infer(
-                (prompts, refer, sv_emb),
-                ref_seq,
-                text_seq,
-                ref_bert,
-                text_bert,
-                top_k,
-            )?;
-            if let Some(start) = stream_infer_start {
-                let elapsed = start.elapsed();
-                info!("stream_infer init time: {:?}", elapsed);
-            }
-
-            let chunk_token_nums = dynamic_chunk_token_nums(
-                text_chars,
-                &inner.chunk_token_nums,
-                &inner.chunk_policy,
-                inner.log_text_metrics,
-            );
-            let mut first_chunk_gen_logged = false;
-            let mut first_chunk_io_logged = false;
-            let mut samples_all = Vec::new();
-            while !cancel_scope.is_cancelled() {
-                let chunk_start = if !first_chunk_gen_logged && inner.log_text_metrics {
-                    Some(Instant::now())
-                } else {
-                    None
-                };
-                let Some(audio) = stream.next_chunk(inner.max_cut_token, &chunk_token_nums)? else {
-                    break;
-                };
-                if let Some(start) = chunk_start {
-                    let elapsed = start.elapsed();
-                    info!("next_chunk first return time: {:?}", elapsed);
-                    first_chunk_gen_logged = true;
-                }
-
-                let audio = audio.contiguous();
-                let audio_size = audio.numel();
-                if audio_size == 0 {
-                    continue;
-                }
-
-                let io_start = if !first_chunk_io_logged && inner.log_text_metrics {
-                    Some(Instant::now())
-                } else {
-                    None
-                };
-                let audio_cpu = audio.f_to_device(tch::Device::Cpu)?.contiguous();
-                let mut samples = vec![0f32; audio_size];
-                audio_cpu.f_copy_data(&mut samples, audio_size)?;
-                samples_all.extend_from_slice(&samples);
-
-                if let Some(start) = io_start {
-                    let elapsed = start.elapsed();
-                    info!("first chunk cpu+append time: {:?}", elapsed);
-                    first_chunk_io_logged = true;
-                }
-            }
-
+            let mut sink = CollectSink::new();
+            run_stream_infer(inner, &text, is_first, &cancel_scope, &mut sink)?;
             let gen_done_ts = Instant::now();
             Ok::<SynthesizedAudio, anyhow::Error>(SynthesizedAudio {
-                samples: samples_all,
+                samples: sink.samples,
                 start_ts,
                 gen_done_ts,
             })

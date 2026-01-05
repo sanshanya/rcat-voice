@@ -85,8 +85,8 @@ It also supports “conservative barge-in”: require a short continuous speech 
 
 Control handles:
 
-- `StreamControl`: holds delta sender + cancel/pause (keeps delta channel open).
-- `StreamCancelHandle`: cancel/pause only (does not keep delta channel open).
+- `StreamControl`: holds delta sender + cancel/interrupt (keeps delta channel open).
+- `StreamCancelHandle`: cancel/interrupt only (does not keep delta channel open).
 
 Lifecycle APIs:
 
@@ -97,10 +97,11 @@ Lifecycle APIs:
 ## Tokenizer Details
 
 - Starts with a few “eager” short segments (lower TTFA), then normal segments.
+- Thresholds are configurable via env vars (`TOKENIZER_*`); see `README.md`.
 - Has a “relax mode” triggered by audio buffer waterline (`buffered_ms()`):
   - if TTS buffer is deep enough, emits larger segments for throughput/efficiency.
 - Each `Segment` carries timestamps:
-  - `task_start` (t0), `first_token_ts` (t1, only first segment), `last_token_ts`, `segment_sent_ts` (t2)
+  - `llm_start_ts` (t0), `first_token_ts` (t1, only first segment), `last_token_ts`, `segment_sent_ts` (t2)
 
 ## Pipeline Details
 
@@ -120,7 +121,7 @@ Playback metrics:
 
 - TTS backends call `stop()` to terminate playback and clear queued work.
 - `audio::CancelToken` uses a monotonic epoch; work checks a `CancelScope` snapshot to avoid global mutable flags.
-- `pause` is treated as “stop and clear queued segments, then allow a new stream to start cleanly”.
+- `interrupt` is treated as “stop and clear queued segments, then allow a new stream to start cleanly”.
 
 ## Audio Backend Contract
 

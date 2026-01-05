@@ -50,7 +50,7 @@ async fn main() -> Result<()> {
     #[cfg(feature = "turn-smart")]
     use std::time::Instant;
     use tokio::time::{Duration, MissedTickBehavior};
-    use tracing::{info, warn};
+    use tracing::{debug, info, warn};
 
     tracing_subscriber::fmt().with_env_filter("info").init();
 
@@ -88,6 +88,12 @@ async fn main() -> Result<()> {
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(30)
         .clamp(1, 120);
+
+    let drop_warn_samples = std::env::var("ASR_MIC_DROP_WARN_SAMPLES")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(100)
+        .clamp(1, 1_000_000);
 
     let device_hint = std::env::var("ASR_MIC_DEVICE").ok();
 
@@ -255,7 +261,11 @@ async fn main() -> Result<()> {
             _ = drop_tick.tick() => {
                 let n = dropped.swap(0, Ordering::AcqRel);
                 if n > 0 {
-                    warn!("voice_assistant: dropped {} samples (ring buffer full)", n);
+                    if n < drop_warn_samples {
+                        debug!("voice_assistant: dropped {} samples (ring buffer full)", n);
+                    } else {
+                        warn!("voice_assistant: dropped {} samples (ring buffer full)", n);
+                    }
                 }
             }
             _ = poll.tick() => {

@@ -18,9 +18,9 @@
 
 ## 关键瓶颈 / 风险点（按对体验影响排序）
 
-1) **ASR ingestion 与识别耦合导致回压**
-- 当前实现是在同一条异步链路里：VAD 出段 → `spawn_blocking` 做识别 → await 等结果。
-- 当识别慢/抖动时，会阻塞输入消费，进而导致 `write_pcm_i16()` 回压，麦克风 ring 可能堆积甚至丢样本（即便 ring 大，也会引入不可控延迟）。
+1) **ASR 段队列溢出策略 / 可观测性**
+- 当前实现已改为：VAD 出段 → **有界 segment queue** → **单 blocking 推理循环**（避免每段 `spawn_blocking` 抖动，并把回压边界清晰化）。
+- 仍需关注：队列满时的策略（例如丢弃新段/丢弃旧段/只保留最新段）以及 dropped 统计与日志阈值，避免“静默丢段”导致体验变差却难以定位。
 
 2) **barge-in / Smart Turn gate 依赖振幅阈值**
 - 纯能量阈值在不同麦克风增益、噪声底、AEC/回声条件下不稳定。
@@ -38,12 +38,9 @@
 
 ### P0（优先做，直接影响稳定低延迟）
 
-**P0.1 解耦 ASR ingestion 与识别**
-- 目标：输入消费实时化，识别慢也不阻塞喂入。
-- 建议拆成两条任务：
-  - Task A：持续接收 PCM → 转 16k mono → 喂 VAD → 输出“语音段”（segment samples + start）
-  - Task B：串行/有界并行地消费“语音段” → 识别 → 输出 `AsrSegment`
-- 关键点：中间 channel 必须**有界**；溢出策略要清晰（例如丢弃最旧段/拒绝新段/只保留最新一段）。
+**P0.1 解耦 ASR ingestion 与识别（已实现）**
+- 已拆分为两条链路：PCM → VAD 分段（async）与“语音段”→ 识别（blocking loop），中间使用有界队列。
+- 可继续做：根据使用场景选择更合适的溢出策略，并把 dropped 指标纳入常规日志/metrics（方便线上调参）。
 
 **P0.2 用 VAD 决策替代振幅阈值（barge-in + Smart Turn gate）**
 - Smart Turn 官方建议：与轻量 VAD 配合，在静音阶段推理。
@@ -98,4 +95,3 @@
 - `ASR_VAD_MIN_SILENCE`：越大越不敏感（更少切段，但出结果更晚）。
 - `SMART_TURN_MIN_SILENCE_MS` / `SMART_TURN_COMMIT_MS`：越大越“稳”，但 turn end 确认更慢。
 - `BARGE_IN_MIN_SPEECH_MS`：越大越不容易误打断；建议从 `400~600ms` 起调。
-

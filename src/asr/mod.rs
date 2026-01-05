@@ -15,7 +15,7 @@ pub mod utils;
 pub mod sherpa;
 
 #[cfg(feature = "asr-sherpa")]
-pub use sherpa::{SherpaAsrConfig, SherpaAsrModel, SherpaAsrStream, SherpaVadConfig};
+pub use sherpa::{AsrModelDtype, SherpaAsrConfig, SherpaAsrModel, SherpaAsrStream, SherpaVadConfig};
 
 /// Convenience: build an ASR stream from env vars.
 #[cfg(feature = "asr-sherpa")]

@@ -6,6 +6,7 @@ use tokio::time::Instant;
 use tracing::warn;
 
 use crate::audio::AudioBackend;
+use crate::internal::env;
 
 pub mod os;
 pub mod remote;
@@ -125,8 +126,7 @@ impl TtsEngineBuilder {
 }
 
 pub fn build_from_env() -> Result<Arc<dyn TtsEngine>> {
-    let backend_raw =
-        std::env::var("TTS_BACKEND").unwrap_or_else(|_| default_backend().to_string());
+    let backend_raw = env::string("TTS_BACKEND").unwrap_or_else(|| default_backend().to_string());
     // Allow values like `tts_backend=gpt-sovits-onnx` (e.g. copied from config snippets)
     // by taking the segment after the last '='.
     let backend = backend_raw

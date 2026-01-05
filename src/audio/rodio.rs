@@ -34,6 +34,23 @@ struct RodioSegmentWriter {
     first_audio_ts: Option<Instant>,
 }
 
+impl RodioSegmentWriter {
+    fn ts_at_sample(&self, stream_start: Instant, sample_idx: u64) -> Instant {
+        let samples_per_second = self.inner.sample_rate as f64 * self.inner.channels as f64;
+        stream_start + Duration::from_secs_f64(sample_idx as f64 / samples_per_second)
+    }
+
+    fn estimate_first_audio_ts(&self, stream_start: Instant) -> Option<Instant> {
+        Some(self.ts_at_sample(stream_start, self.start_written?))
+    }
+
+    fn update_first_audio_ts(&mut self, stream_start: Instant) {
+        if self.first_audio_ts.is_none() {
+            self.first_audio_ts = self.estimate_first_audio_ts(stream_start);
+        }
+    }
+}
+
 impl RodioBackend {
     pub fn new() -> Result<Self> {
         Self::from_config(RodioConfig::default())
@@ -141,51 +158,24 @@ impl SegmentWriter for RodioSegmentWriter {
         }
 
         if self.start_written.is_none() {
-            let consumed = self.inner.playback.consumed_samples.load(Ordering::Acquire);
-            let mut written = self.inner.playback.written_samples.load(Ordering::Acquire);
-            while written < consumed {
-                match self.inner.playback.written_samples.compare_exchange(
-                    written,
-                    consumed,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                ) {
-                    Ok(_) => {
-                        written = consumed;
-                        break;
-                    }
-                    Err(current) => written = current,
-                }
-            }
-            self.start_written = Some(written);
+            self.start_written = Some(self.inner.playback.begin_write());
         }
 
         let written = self.inner.ring.push_blocking(samples, cancel);
         if written == 0 {
             return 0;
         }
-        self.inner
-            .playback
-            .written_samples
-            .fetch_add(written as u64, Ordering::AcqRel);
+        self.inner.playback.on_write(written as u64);
         self.written_total += written as u64;
 
         if self.first_audio_ts.is_none() {
-            let samples_per_second =
-                self.inner.sample_rate as f64 * self.inner.channels as f64;
-            if let Some(stream_start) = self.inner.playback.try_start(self.inner.ring.len() as u64)
-            {
-                if let Some(start_at) = self.start_written {
-                    self.first_audio_ts = Some(
-                        stream_start + Duration::from_secs_f64(start_at as f64 / samples_per_second),
-                    );
-                }
-            } else if let Some(stream_start) = self.inner.playback.stream_start() {
-                if let Some(start_at) = self.start_written {
-                    self.first_audio_ts = Some(
-                        stream_start + Duration::from_secs_f64(start_at as f64 / samples_per_second),
-                    );
-                }
+            let stream_start = self
+                .inner
+                .playback
+                .try_start(self.inner.ring.len() as u64)
+                .or_else(|| self.inner.playback.stream_start());
+            if let Some(stream_start) = stream_start {
+                self.update_first_audio_ts(stream_start);
             }
         }
 
@@ -210,23 +200,13 @@ impl SegmentWriter for RodioSegmentWriter {
             .playback
             .stream_start()
             .unwrap_or_else(|| self.inner.playback.force_start());
-        if self.first_audio_ts.is_none() {
-            let samples_per_second =
-                self.inner.sample_rate as f64 * self.inner.channels as f64;
-            if let Some(start_at) = self.start_written {
-                self.first_audio_ts = Some(
-                    stream_start + Duration::from_secs_f64(start_at as f64 / samples_per_second),
-                );
-            }
-        }
+        self.update_first_audio_ts(stream_start);
 
         let start_at = self
             .start_written
-            .unwrap_or_else(|| self.inner.playback.written_samples.load(Ordering::Acquire));
+            .unwrap_or_else(|| self.inner.playback.written());
         let end_written = start_at + self.written_total;
-        let samples_per_second = self.inner.sample_rate as f64 * self.inner.channels as f64;
-        let play_done_ts =
-            stream_start + Duration::from_secs_f64(end_written as f64 / samples_per_second);
+        let play_done_ts = self.ts_at_sample(stream_start, end_written);
 
         let (tx, rx) = oneshot::channel();
         self.inner.playback.push_marker(end_written, tx);
@@ -235,6 +215,14 @@ impl SegmentWriter for RodioSegmentWriter {
             first_audio_ts: self.first_audio_ts,
             play_done_ts,
             play_done_rx: Some(rx),
+        }
+    }
+}
+
+impl Drop for RodioSegmentWriter {
+    fn drop(&mut self) {
+        if self.active {
+            self.inner.active_writer.store(false, Ordering::Release);
         }
     }
 }
@@ -264,6 +252,46 @@ impl PlaybackState {
             consumed_samples: AtomicU64::new(0),
             prebuffer_samples,
             markers: StdMutex::new(VecDeque::new()),
+        }
+    }
+
+    fn is_started(&self) -> bool {
+        self.started.load(Ordering::Acquire)
+    }
+
+    fn begin_write(&self) -> u64 {
+        let consumed = self.consumed_samples.load(Ordering::Acquire);
+        let mut written = self.written_samples.load(Ordering::Acquire);
+        while written < consumed {
+            match self.written_samples.compare_exchange(
+                written,
+                consumed,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return consumed,
+                Err(current) => written = current,
+            }
+        }
+        written
+    }
+
+    fn on_write(&self, samples: u64) {
+        let _ = self.written_samples.fetch_add(samples, Ordering::AcqRel);
+    }
+
+    fn written(&self) -> u64 {
+        self.written_samples.load(Ordering::Acquire)
+    }
+
+    fn on_output_sample(&self, consumed: bool) {
+        let played = self.played_samples.fetch_add(1, Ordering::Relaxed) + 1;
+        if consumed {
+            let _ = self.consumed_samples.fetch_add(1, Ordering::Relaxed);
+        }
+        if played % MARKER_CHECK_INTERVAL == 0 {
+            let consumed = self.consumed_samples.load(Ordering::Acquire);
+            self.check_markers(consumed);
         }
     }
 
@@ -330,6 +358,21 @@ impl PlaybackState {
             let _ = marker.done_tx.send(Instant::now());
         }
     }
+
+    fn check_markers(&self, consumed_samples: u64) {
+        let mut markers = self
+            .markers
+            .lock()
+            .expect("playback marker lock poisoned");
+        while let Some(marker) = markers.front() {
+            if marker.end_sample > consumed_samples {
+                break;
+            }
+            if let Some(marker) = markers.pop_front() {
+                let _ = marker.done_tx.send(Instant::now());
+            }
+        }
+    }
 }
 
 struct RingBuffer {
@@ -345,13 +388,21 @@ impl RingBuffer {
 
     fn push_blocking(&self, data: &[f32], cancel: &CancelScope) -> usize {
         let mut written = 0usize;
+        let mut backoff = 0u32;
         while written < data.len() {
             if cancel.is_cancelled() {
                 break;
             }
             match self.queue.push(data[written]) {
-                Ok(()) => written += 1,
-                Err(_) => std::thread::sleep(Duration::from_millis(1)),
+                Ok(()) => {
+                    written += 1;
+                    backoff = 0;
+                }
+                Err(_) => {
+                    let delay_us = 100u64 << backoff.min(3);
+                    std::thread::sleep(Duration::from_micros(delay_us));
+                    backoff = backoff.saturating_add(1);
+                }
             }
         }
         written
@@ -391,29 +442,13 @@ impl RingBufferSource {
             channels,
         }
     }
-
-    fn check_markers(&self, consumed_samples: u64) {
-        let mut markers = self
-            .playback
-            .markers
-            .lock()
-            .expect("playback marker lock poisoned");
-        while let Some(marker) = markers.front() {
-            if marker.end_sample > consumed_samples {
-                break;
-            }
-            if let Some(marker) = markers.pop_front() {
-                let _ = marker.done_tx.send(Instant::now());
-            }
-        }
-    }
 }
 
 impl Iterator for RingBufferSource {
     type Item = f32;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if !self.playback.started.load(Ordering::Acquire) {
+        if !self.playback.is_started() {
             return Some(0.0);
         }
         let mut consumed_sample = false;
@@ -424,20 +459,7 @@ impl Iterator for RingBufferSource {
             }
             None => 0.0,
         };
-        let played = self
-            .playback
-            .played_samples
-            .fetch_add(1, Ordering::Relaxed)
-            + 1;
-        if consumed_sample {
-            self.playback
-                .consumed_samples
-                .fetch_add(1, Ordering::Relaxed);
-        }
-        if played % MARKER_CHECK_INTERVAL == 0 {
-            let consumed = self.playback.consumed_samples.load(Ordering::Acquire);
-            self.check_markers(consumed);
-        }
+        self.playback.on_output_sample(consumed_sample);
         Some(sample)
     }
 }

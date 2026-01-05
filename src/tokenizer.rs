@@ -3,16 +3,59 @@ use tokio::sync::{mpsc, watch};
 
 use tokio::time::Instant;
 
-// 放松模式下的硬上限字符数。
-const RELAXED_HARD_MAX_CHARS: usize = 120;
+use crate::internal::env;
+
+const THRESHOLD_MAX_CHARS: usize = 400;
+
+#[derive(Debug, Clone, Copy)]
+struct FlushThresholds {
+    min_chars: usize,
+    soft_max: usize,
+    hard_max: usize,
+}
+
+const EAGER_DEFAULT: FlushThresholds = FlushThresholds {
+    min_chars: 2,
+    soft_max: 6,
+    hard_max: 12,
+};
+
+const NORMAL_DEFAULT: FlushThresholds = FlushThresholds {
+    min_chars: 10,
+    soft_max: 20,
+    hard_max: 40,
+};
+
+const RELAX_DEFAULT: FlushThresholds = FlushThresholds {
+    min_chars: 20,
+    soft_max: 35,
+    hard_max: 80,
+};
+
+impl FlushThresholds {
+    fn from_env(prefix: &str, defaults: FlushThresholds) -> Self {
+        let (min_chars, soft_max, hard_max) = env::usize_threshold_triplet(
+            prefix,
+            defaults.min_chars,
+            defaults.soft_max,
+            defaults.hard_max,
+            THRESHOLD_MAX_CHARS,
+        );
+        Self {
+            min_chars,
+            soft_max,
+            hard_max,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 /// 发送到 TTS 管线的文本片段（含时间戳）。
 pub struct Segment {
     /// 片段文本内容。
     pub text: String,
-    /// 任务起点时间戳（t0）。
-    pub task_start: Instant,
+    /// LLM 请求起点时间戳（t0）。若未显式标记，则为会话创建时间。
+    pub llm_start_ts: Instant,
     /// 首个 LLM token 时间戳（t1），仅首段设置。
     pub first_token_ts: Option<Instant>,
     /// 发送该片段前观测到的最后一个 LLM token 时间戳。
@@ -25,27 +68,15 @@ pub struct Segment {
 #[derive(Debug, Clone)]
 pub struct TokenizerConfig {
     pub eager_chunks: usize,
-    pub min_chars: usize,
-    pub max_chars: usize,
-    pub boundary_overflow: usize,
     pub relax_buffer_ms: u64,
-    pub relax_scale: f32,
-    pub relax_boundary_window: usize,
-    pub relax_overflow: usize,
     pub relax_log: bool,
 }
 
 impl Default for TokenizerConfig {
     fn default() -> Self {
         Self {
-            eager_chunks: 2,
-            min_chars: 20,
-            max_chars: 50,
-            boundary_overflow: 20,
+            eager_chunks: 1,
             relax_buffer_ms: 200,
-            relax_scale: 1.5,
-            relax_boundary_window: 24,
-            relax_overflow: 30,
             relax_log: false,
         }
     }
@@ -54,60 +85,21 @@ impl Default for TokenizerConfig {
 impl TokenizerConfig {
     pub fn from_env() -> Self {
         let mut cfg = Self::default();
-        if let Ok(value) = std::env::var("CHUNKER_EAGER_CHUNKS") {
-            if let Ok(parsed) = value.parse::<usize>() {
-                cfg.eager_chunks = parsed;
-            }
+        if let Some(parsed) = env::get::<usize>("TOKENIZER_EAGER_CHUNKS")
+            .or_else(|| env::get::<usize>("CHUNKER_EAGER_CHUNKS"))
+        {
+            cfg.eager_chunks = parsed;
         }
-        if let Ok(value) = std::env::var("TOKENIZER_MIN_CHARS") {
-            if let Ok(parsed) = value.parse::<usize>() {
-                cfg.min_chars = parsed.clamp(5, 200);
-            }
+        if let Some(parsed) = env::get::<u64>("TOKENIZER_RELAX_BUFFER_MS") {
+            cfg.relax_buffer_ms = parsed.clamp(0, 60_000);
         }
-        if let Ok(value) = std::env::var("TOKENIZER_MAX_CHARS") {
-            if let Ok(parsed) = value.parse::<usize>() {
-                cfg.max_chars = parsed.clamp(cfg.min_chars + 5, 400);
-            }
-        }
-        if let Ok(value) = std::env::var("TOKENIZER_BOUNDARY_OVERFLOW") {
-            if let Ok(parsed) = value.parse::<usize>() {
-                cfg.boundary_overflow = parsed.clamp(0, 200);
-            }
-        }
-        if let Ok(value) = std::env::var("TOKENIZER_RELAX_BUFFER_MS") {
-            if let Ok(parsed) = value.parse::<u64>() {
-                cfg.relax_buffer_ms = parsed.clamp(0, 60_000);
-            }
-        }
-        if let Ok(value) = std::env::var("TOKENIZER_RELAX_SCALE") {
-            if let Ok(parsed) = value.parse::<f32>() {
-                cfg.relax_scale = parsed.clamp(1.0, 3.0);
-            }
-        }
-        if let Ok(value) = std::env::var("TOKENIZER_RELAX_BOUNDARY_WINDOW") {
-            if let Ok(parsed) = value.parse::<usize>() {
-                cfg.relax_boundary_window = parsed.clamp(0, 200);
-            }
-        }
-        if let Ok(value) = std::env::var("TOKENIZER_RELAX_OVERFLOW") {
-            if let Ok(parsed) = value.parse::<usize>() {
-                cfg.relax_overflow = parsed.clamp(0, 400);
-            }
-        }
-        if let Ok(value) = std::env::var("TOKENIZER_RELAX_LOG") {
-            cfg.relax_log = value == "1";
-        }
+        cfg.relax_log = env::bool01("TOKENIZER_RELAX_LOG", cfg.relax_log);
         cfg.normalize()
     }
 
     pub fn normalize(mut self) -> Self {
-        self.min_chars = self.min_chars.clamp(5, 200);
-        self.max_chars = self.max_chars.clamp(self.min_chars + 5, 400);
-        self.boundary_overflow = self.boundary_overflow.clamp(0, 200);
+        self.eager_chunks = self.eager_chunks.clamp(0, 32);
         self.relax_buffer_ms = self.relax_buffer_ms.clamp(0, 60_000);
-        self.relax_scale = self.relax_scale.clamp(1.0, 3.0);
-        self.relax_boundary_window = self.relax_boundary_window.clamp(0, 200);
-        self.relax_overflow = self.relax_overflow.clamp(0, 400);
         self
     }
 }
@@ -116,9 +108,9 @@ pub struct Tokenizer {
     delta_rx: mpsc::Receiver<String>,
     chunk_tx: mpsc::Sender<Segment>,
     cancel_rx: watch::Receiver<bool>,
-    pause_rx: watch::Receiver<bool>,
+    interrupt_rx: watch::Receiver<u64>,
     buffer_ms_rx: watch::Receiver<u64>,
-    task_start: Instant, // t0 基准
+    session_start_ts: Instant, // t0 fallback
     llm_start: Arc<OnceLock<Instant>>,
     config: TokenizerConfig,
 }
@@ -128,9 +120,9 @@ impl Tokenizer {
         delta_rx: mpsc::Receiver<String>,
         chunk_tx: mpsc::Sender<Segment>,
         cancel_rx: watch::Receiver<bool>,
-        pause_rx: watch::Receiver<bool>,
+        interrupt_rx: watch::Receiver<u64>,
         buffer_ms_rx: watch::Receiver<u64>,
-        task_start: Instant,
+        session_start_ts: Instant,
         llm_start: Arc<OnceLock<Instant>>,
         config: TokenizerConfig,
     ) -> Self {
@@ -138,9 +130,9 @@ impl Tokenizer {
             delta_rx,
             chunk_tx,
             cancel_rx,
-            pause_rx,
+            interrupt_rx,
             buffer_ms_rx,
-            task_start,
+            session_start_ts,
             llm_start,
             config: config.normalize(),
         }
@@ -150,18 +142,18 @@ impl Tokenizer {
         delta_rx: mpsc::Receiver<String>,
         chunk_tx: mpsc::Sender<Segment>,
         cancel_rx: watch::Receiver<bool>,
-        pause_rx: watch::Receiver<bool>,
+        interrupt_rx: watch::Receiver<u64>,
         buffer_ms_rx: watch::Receiver<u64>,
-        task_start: Instant,
+        session_start_ts: Instant,
         llm_start: Arc<OnceLock<Instant>>,
     ) -> Self {
         Self::new(
             delta_rx,
             chunk_tx,
             cancel_rx,
-            pause_rx,
+            interrupt_rx,
             buffer_ms_rx,
-            task_start,
+            session_start_ts,
             llm_start,
             TokenizerConfig::from_env(),
         )
@@ -182,14 +174,14 @@ impl Tokenizer {
             text = text.trim_start_matches('\u{feff}').to_string();
         }
 
-        let task_start = self
+        let llm_start_ts = self
             .llm_start
             .get()
             .copied()
-            .unwrap_or(self.task_start);
+            .unwrap_or(self.session_start_ts);
         let chunk = Segment {
             text,
-            task_start,
+            llm_start_ts,
             first_token_ts: if *first { first_delta_ts } else { None },
             last_token_ts: last_delta_ts,
             segment_sent_ts: Instant::now(),
@@ -203,6 +195,9 @@ impl Tokenizer {
     }
 
     pub async fn run(mut self) {
+        let eager_thresholds = FlushThresholds::from_env("TOKENIZER_EAGER", EAGER_DEFAULT);
+        let normal_thresholds = FlushThresholds::from_env("TOKENIZER_NORMAL", NORMAL_DEFAULT);
+        let relax_thresholds = FlushThresholds::from_env("TOKENIZER_RELAX", RELAX_DEFAULT);
         let mut buf = String::new();
         let mut first = true;
         let mut first_delta_ts: Option<Instant> = None;
@@ -210,19 +205,9 @@ impl Tokenizer {
         let mut eager_chunks_remaining = self.config.eager_chunks;
         let eager_chunks_default = eager_chunks_remaining;
         let mut cancel_closed = false;
-        let mut pause_closed = false;
+        let mut interrupt_closed = false;
 
-        let min_chars = self.config.min_chars;
-        let max_chars = self.config.max_chars;
-        let normal_overflow = self.config.boundary_overflow;
-        let hard_max = max_chars.min(600);
         let relax_buffer_ms = self.config.relax_buffer_ms;
-        let relax_scale = self.config.relax_scale;
-        let relax_boundary_window = self.config.relax_boundary_window;
-        let relax_overflow = self.config.relax_overflow;
-        let relaxed_max_chars = ((max_chars as f32) * relax_scale).round() as usize;
-        let relaxed_max_chars = relaxed_max_chars.clamp(max_chars, RELAXED_HARD_MAX_CHARS);
-        let relaxed_hard_max = RELAXED_HARD_MAX_CHARS;
         let relax_log = self.config.relax_log;
         let mut relax_active = false;
         loop {
@@ -234,18 +219,17 @@ impl Tokenizer {
                     }
                     if *self.cancel_rx.borrow() { break; }
                 }
-                res = self.pause_rx.changed(), if !pause_closed => {
+                res = self.interrupt_rx.changed(), if !interrupt_closed => {
                     if res.is_err() {
-                        pause_closed = true;
+                        interrupt_closed = true;
                         continue;
                     }
-                    if *self.pause_rx.borrow() {
-                        buf.clear();
-                        first = true;
-                        first_delta_ts = None;
-                        last_delta_ts = None;
-                        eager_chunks_remaining = eager_chunks_default;
-                    }
+                    buf.clear();
+                    while self.delta_rx.try_recv().is_ok() {}
+                    first = true;
+                    first_delta_ts = None;
+                    last_delta_ts = None;
+                    eager_chunks_remaining = eager_chunks_default;
                 }
                 maybe = self.delta_rx.recv() => {
                     let Some(delta) = maybe else {
@@ -264,53 +248,40 @@ impl Tokenizer {
 
                     buf.push_str(&delta);
 
-                    let (min_c, max_c, limit, relax_now) = if eager_chunks_remaining > 0 {
-                        (10usize, 20usize, 20usize, false) // Eager chunks for low TTFA/second-play delay
+                    let mut buffered_ms_for_log: Option<u64> = None;
+                    let (thresholds, relax_now) = if eager_chunks_remaining > 0 {
+                        (eager_thresholds, false)
                     } else {
                         let buffered_ms = *self.buffer_ms_rx.borrow();
+                        buffered_ms_for_log = Some(buffered_ms);
                         let relax_now = relax_buffer_ms > 0 && buffered_ms >= relax_buffer_ms;
-                        let max_c = if relax_now { relaxed_max_chars } else { max_chars };
-                        let limit = if relax_now { relaxed_hard_max } else { hard_max };
-                        (min_chars, max_c, limit, relax_now)
-                    };
-                    if relax_log && relax_now != relax_active {
-                        relax_active = relax_now;
-                        let buffered_ms = *self.buffer_ms_rx.borrow();
-                        if relax_active {
-                            tracing::info!(
-                                "Tokenizer relax on (buffer={}ms, max_chars={}, hard_max={})",
-                                buffered_ms,
-                                max_c,
-                                limit
-                            );
+                        let thresholds = if relax_now {
+                            relax_thresholds
                         } else {
-                            tracing::info!(
-                                "Tokenizer relax off (buffer={}ms)",
-                                buffered_ms
-                            );
-                        }
-                    }
-                    let trigger_strong_boundary = !relax_now;
-                    let trigger_weak_boundary = !relax_now;
-                    let strong_min_chars = if relax_now { 1 } else { min_chars };
-                    let weak_min_chars = min_chars;
-                    let hard_limit = if relax_now {
-                        relaxed_hard_max.saturating_add(relax_overflow)
-                    } else {
-                        limit.saturating_add(normal_overflow)
+                            normal_thresholds
+                        };
+                        (thresholds, relax_now)
                     };
+                    let (min_c, soft_max, hard_max) = (
+                        thresholds.min_chars,
+                        thresholds.soft_max,
+                        thresholds.hard_max,
+                    );
+                    if relax_log && relax_now != relax_active {
+                        let buffered_ms = buffered_ms_for_log
+                            .unwrap_or_else(|| *self.buffer_ms_rx.borrow());
+                        log_relax_transition(
+                            relax_now,
+                            &mut relax_active,
+                            buffered_ms,
+                            (min_c, soft_max, hard_max),
+                        );
+                    }
                     if let Some(cut_idx) = find_flush_index(
                         &buf,
                         min_c,
-                        max_c,
-                        limit,
-                        hard_limit,
-                        strong_min_chars,
-                        weak_min_chars,
-                        trigger_strong_boundary,
-                        trigger_weak_boundary,
-                        relax_now,
-                        relax_boundary_window,
+                        soft_max,
+                        hard_max,
                     ) {
                         let remaining = buf.split_off(cut_idx);
                         let pending = std::mem::replace(&mut buf, remaining);
@@ -330,118 +301,164 @@ impl Tokenizer {
     }
 }
 
+fn log_relax_transition(
+    relax_now: bool,
+    relax_active: &mut bool,
+    buffered_ms: u64,
+    thresholds: (usize, usize, usize),
+) {
+    if relax_now == *relax_active {
+        return;
+    }
+    *relax_active = relax_now;
+    if relax_now {
+        let (min_c, soft_max, hard_max) = thresholds;
+        tracing::info!(
+            "Tokenizer relax on (buffer={}ms, min={}, soft_max={}, hard_max={})",
+            buffered_ms,
+            min_c,
+            soft_max,
+            hard_max
+        );
+    } else {
+        tracing::info!("Tokenizer relax off (buffer={}ms)", buffered_ms);
+    }
+}
+
 fn find_flush_index(
     s: &str,
     min_chars: usize,
-    max_chars: usize,
+    soft_max: usize,
     hard_max: usize,
-    hard_limit: usize,
-    strong_min_chars: usize,
-    weak_min_chars: usize,
-    trigger_strong_boundary: bool,
-    trigger_weak_boundary: bool,
-    relax_mode: bool,
-    relax_boundary_window: usize,
 ) -> Option<usize> {
-    let mut count = 0usize;
-    let mut last_strong: Option<(usize, usize)> = None;
-    let mut last_weak: Option<(usize, usize)> = None;
-    let mut hard_cut: Option<usize> = None;
-
-    for (idx, ch) in s.char_indices() {
-        count += 1;
-        if count == hard_max {
-            hard_cut = Some(idx + ch.len_utf8());
-        }
-        if matches!(ch, '。' | '！' | '？' | '!' | '?' | '\n') {
-            last_strong = Some((idx + ch.len_utf8(), count));
-        } else if matches!(ch, '，' | ',' | '；' | ';' | '：' | ':') {
-            last_weak = Some((idx + ch.len_utf8(), count));
-        }
-    }
+    let scan = scan_boundaries(s, hard_max);
+    let count = scan.total_chars;
 
     if count < min_chars {
         return None;
     }
 
-    let ends_with_strong = last_strong.map_or(false, |(idx, _)| idx == s.len());
-    if trigger_strong_boundary && ends_with_strong {
-        return Some(s.len());
-    }
-    let ends_with_weak = last_weak.map_or(false, |(idx, _)| idx == s.len());
-    if trigger_weak_boundary && ends_with_weak {
-        return Some(s.len());
+    if count < soft_max {
+        return scan.ends_with_boundary.then_some(s.len());
     }
 
-    if count < max_chars {
-        return None;
-    }
-    if relax_mode && count < hard_max {
-        return None;
+    let window_chars = hard_max.saturating_sub(soft_max).max(min_chars);
+
+    if count < hard_max {
+        let window_start = count.saturating_sub(window_chars);
+        return scan
+            .last_boundary
+            .filter(|hit| hit.char_count >= min_chars && hit.char_count >= window_start)
+            .map(|hit| hit.byte_idx);
     }
 
-    if relax_mode {
-        let window_start = count.saturating_sub(relax_boundary_window);
-        let near_strong = last_strong
-            .filter(|(_, boundary_count)| *boundary_count >= window_start);
-        let near_weak = last_weak
-            .filter(|(_, boundary_count)| *boundary_count >= window_start);
-        if count >= hard_max {
-            if let Some((idx, boundary_count)) = near_strong {
-                if boundary_count >= strong_min_chars {
-                    return Some(idx);
-                }
-            }
-            if let Some((idx, boundary_count)) = near_weak {
-                if boundary_count >= weak_min_chars {
-                    return Some(idx);
-                }
-            }
-            if count < hard_limit {
-                return None;
-            }
-            if let Some((idx, boundary_count)) = last_strong {
-                if boundary_count >= strong_min_chars {
-                    return Some(idx);
-                }
-            }
-            if let Some((idx, boundary_count)) = last_weak {
-                if boundary_count >= weak_min_chars {
-                    return Some(idx);
-                }
-            }
-            if let Some((idx, _)) = last_strong.or(last_weak) {
-                return Some(idx);
-            }
-            return hard_cut.or_else(|| Some(s.len()));
-        }
-    } else if count >= hard_max {
-        if let Some((idx, boundary_count)) = last_strong {
-            if boundary_count >= strong_min_chars {
-                return Some(idx);
-            }
-        }
-        if let Some((idx, boundary_count)) = last_weak {
-            if boundary_count >= weak_min_chars {
-                return Some(idx);
-            }
-        }
-        if let Some((idx, _)) = last_strong.or(last_weak) {
-            return Some(idx);
-        }
-        return hard_cut.or_else(|| Some(s.len()));
-    }
+    let window_start = hard_max.saturating_sub(window_chars);
+    scan.last_boundary_before_hard_max
+        .filter(|hit| hit.char_count >= min_chars && hit.char_count >= window_start)
+        .map(|hit| hit.byte_idx)
+        .or(scan.hard_cut)
+}
 
-    if let Some((idx, boundary_count)) = last_strong {
-        if boundary_count >= strong_min_chars {
-            return Some(idx);
+#[derive(Debug, Clone, Copy)]
+struct BoundaryHit {
+    byte_idx: usize,
+    char_count: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BoundaryScan {
+    total_chars: usize,
+    ends_with_boundary: bool,
+    last_boundary: Option<BoundaryHit>,
+    last_boundary_before_hard_max: Option<BoundaryHit>,
+    hard_cut: Option<usize>,
+}
+
+fn scan_boundaries(s: &str, hard_max: usize) -> BoundaryScan {
+    let mut total_chars = 0usize;
+    let mut last_boundary: Option<BoundaryHit> = None;
+    let mut last_boundary_before_hard_max: Option<BoundaryHit> = None;
+    let mut hard_cut: Option<usize> = None;
+
+    for (idx, ch) in s.char_indices() {
+        total_chars += 1;
+        let next = idx + ch.len_utf8();
+        if matches!(
+            ch,
+            '。' | '！' | '？' | '!' | '?' | '\n' | '，' | ',' | '；' | ';' | '：' | ':'
+        ) {
+            last_boundary = Some(BoundaryHit {
+                byte_idx: next,
+                char_count: total_chars,
+            });
         }
-    }
-    if let Some((idx, boundary_count)) = last_weak {
-        if boundary_count >= weak_min_chars {
-            return Some(idx);
+        if hard_max > 0 && total_chars == hard_max {
+            hard_cut = Some(next);
+            last_boundary_before_hard_max = last_boundary;
         }
     }
 
-    None
+    let ends_with_boundary = last_boundary.map_or(false, |hit| hit.byte_idx == s.len());
+    BoundaryScan {
+        total_chars,
+        ends_with_boundary,
+        last_boundary,
+        last_boundary_before_hard_max,
+        hard_cut,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flush_requires_min_chars() {
+        let s = "Hi!";
+        let idx = find_flush_index(s, 5, 20, 30);
+        assert_eq!(idx, None);
+    }
+
+    #[test]
+    fn flush_on_strong_boundary_at_end() {
+        let s = "Hello!";
+        let idx = find_flush_index(s, 1, 20, 30);
+        assert_eq!(idx, Some(s.len()));
+    }
+
+    #[test]
+    fn flush_on_weak_boundary_when_over_max() {
+        let s = "abcd,efgh";
+        let idx = find_flush_index(s, 1, 5, 12);
+        assert_eq!(idx, Some(5));
+    }
+
+    #[test]
+    fn hard_cut_when_no_boundary_and_over_hard_limit() {
+        let s = "abcdefghij";
+        let idx = find_flush_index(s, 1, 5, 8);
+        assert_eq!(idx, Some(8));
+    }
+
+    #[test]
+    fn waits_for_hard_max_if_tail_window_has_no_boundary() {
+        let s = "ab,cdef";
+        let idx = find_flush_index(s, 1, 5, 8);
+        assert_eq!(idx, None);
+
+        let s2 = "ab,cdefg";
+        let idx2 = find_flush_index(s2, 1, 5, 8);
+        assert_eq!(idx2, Some(8));
+    }
+
+    #[test]
+    fn ignores_boundary_before_min_chars() {
+        let s = "ab,xxxxxxxxxx";
+        let idx = find_flush_index(s, 5, 10, 20);
+        assert_eq!(idx, None);
+
+        let s2 = "ab,xxxxxxxxxxxxxxxxx";
+        let idx2 = find_flush_index(s2, 5, 10, 20);
+        assert_eq!(idx2, Some(20));
+    }
 }

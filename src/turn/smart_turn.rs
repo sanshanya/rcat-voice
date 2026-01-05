@@ -1,10 +1,10 @@
 use anyhow::{Context, Result, anyhow, bail};
 use std::collections::VecDeque;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use crate::asr::utils::{LinearResampler, pcm_i16_to_mono_f32};
+use crate::internal::{env, model_locator};
 
 const WINDOW_SECONDS: usize = 8;
 
@@ -16,20 +16,13 @@ pub struct SmartTurnConfig {
 
 impl SmartTurnConfig {
     pub fn from_env() -> Result<Self> {
-        let model = std::env::var("SMART_TURN_MODEL")
-            .ok()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
+        let model = env::string("SMART_TURN_MODEL")
             .map(PathBuf::from)
             .context(
                 "SMART_TURN_MODEL is required (path to smart-turn-v3*.onnx, or a directory containing it)",
             )?;
         let model = resolve_smart_turn_model_path(model)?;
-        let threshold = std::env::var("SMART_TURN_THRESHOLD")
-            .ok()
-            .and_then(|v| v.parse::<f32>().ok())
-            .unwrap_or(0.5)
-            .clamp(0.0, 1.0);
+        let threshold = env::f32_clamped("SMART_TURN_THRESHOLD", 0.5, 0.0, 1.0);
         Ok(Self { model, threshold })
     }
 }
@@ -247,10 +240,7 @@ impl SmartTurnDetector {
 
 /// Convenience: load a Smart Turn model from the default env var and return the resolved path.
 pub fn model_path_from_env() -> Result<PathBuf> {
-    let model = std::env::var("SMART_TURN_MODEL")
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
+    let model = env::string("SMART_TURN_MODEL")
         .map(PathBuf::from)
         .context(
             "SMART_TURN_MODEL is required (path to smart-turn-v3*.onnx, or a directory containing it)",
@@ -276,47 +266,12 @@ fn resolve_smart_turn_model_path(model: PathBuf) -> Result<PathBuf> {
     }
 
     if model.is_dir() {
-        let mut candidates = Vec::<PathBuf>::new();
-        let dir = &model;
-        for entry in fs::read_dir(dir)
-            .with_context(|| format!("failed to read SMART_TURN_MODEL directory: {}", dir.display()))?
-        {
-            let entry = entry?;
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-            if !is_model_path(&path) {
-                continue;
-            }
-            let file_name = path
-                .file_name()
-                .and_then(|v| v.to_str())
-                .unwrap_or_default()
-                .to_lowercase();
-            if file_name.contains("smart-turn") || file_name.contains("smart_turn") {
-                candidates.push(path);
-            }
-        }
-
-        return match candidates.len() {
-            0 => bail!(
-                "SMART_TURN_MODEL points to a directory but no smart-turn*.onnx file was found: {}",
-                dir.display()
-            ),
-            1 => Ok(candidates.swap_remove(0)),
-            _ => {
-                candidates.sort();
-                let list = candidates
-                    .iter()
-                    .map(|p| format!("- {}", p.display()))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                bail!(
-                    "SMART_TURN_MODEL points to a directory with multiple smart-turn*.onnx candidates. Please set SMART_TURN_MODEL to an explicit file path.\n{list}"
-                );
-            }
-        };
+        return model_locator::resolve_unique_file_in_dir(
+            &model,
+            "SMART_TURN_MODEL",
+            "onnx",
+            |name| name.contains("smart-turn") || name.contains("smart_turn"),
+        );
     }
 
     if !model.exists() {

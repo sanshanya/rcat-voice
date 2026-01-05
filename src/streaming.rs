@@ -1,4 +1,5 @@
 use crate::generator::TtsEngine;
+use crate::internal::env;
 use anyhow::Result;
 use crate::pipeline::{Pipeline, PipelineConfig};
 use crate::tokenizer::{Segment, Tokenizer, TokenizerConfig};
@@ -6,6 +7,48 @@ use std::sync::{Arc, OnceLock};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, Instant};
+use tracing::debug;
+
+#[derive(Clone)]
+struct SessionCancel {
+    cancel_tx: watch::Sender<bool>,
+    interrupt_tx: watch::Sender<u64>,
+    tts_engine: Arc<dyn TtsEngine>,
+}
+
+impl SessionCancel {
+    async fn interrupt(&self) -> Result<()> {
+        let next = self.interrupt_tx.borrow().wrapping_add(1);
+        if let Err(e) = self.interrupt_tx.send(next) {
+            debug!("stream: interrupt signal send failed: {e:?}");
+        }
+        self.tts_engine.stop().await?;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    #[deprecated(note = "Use interrupt() (this is a barge-in style interrupt, not pause/resume).")]
+    async fn pause(&self) -> Result<()> {
+        self.interrupt().await
+    }
+
+    async fn cancel(&self) -> Result<()> {
+        if let Err(e) = self.cancel_tx.send(true) {
+            debug!("stream: cancel signal send failed: {e:?}");
+        }
+        self.tts_engine.stop().await?;
+        Ok(())
+    }
+
+    async fn cancel_best_effort(&self) {
+        if let Err(e) = self.cancel_tx.send(true) {
+            debug!("stream: cancel signal send failed: {e:?}");
+        }
+        if let Err(e) = self.tts_engine.stop().await {
+            debug!("stream: stop failed during cancel: {e}");
+        }
+    }
+}
 
 /// Stream session configuration.
 #[derive(Debug, Clone)]
@@ -28,11 +71,8 @@ impl Default for StreamConfig {
 impl StreamConfig {
     pub fn from_env() -> Self {
         let mut cfg = Self::default();
-        if let Ok(value) = std::env::var("AUDIO_BUFFER_POLL_MS") {
-            if let Ok(parsed) = value.parse::<u64>() {
-                cfg.buffer_poll_ms = parsed.clamp(5, 500);
-            }
-        }
+        cfg.buffer_poll_ms =
+            env::u64_clamped("AUDIO_BUFFER_POLL_MS", cfg.buffer_poll_ms, 5, 500);
         cfg
     }
 }
@@ -93,14 +133,20 @@ impl StreamSessionBuilder {
 #[derive(Clone)]
 pub struct StreamControl {
     delta_tx: mpsc::Sender<String>,
-    cancel_tx: watch::Sender<bool>,
-    pause_tx: watch::Sender<bool>,
-    tts_engine: Arc<dyn TtsEngine>,
+    cancel: SessionCancel,
     llm_start: Arc<OnceLock<Instant>>,
 }
 
 impl StreamControl {
-    /// 可克隆的 sender，用于写入 LLM 流式增量。
+    /// 返回可克隆的 delta sender，用于写入 LLM 流式增量。
+    ///
+    /// ⚠️ 注意：持有此 sender 的任何 clone 都会阻止 channel 关闭，导致
+    /// [`StreamSession::finish`] / [`StreamSession::finish_or_cancel`] 无法正常结束。
+    ///
+    /// 如需可控结束：
+    /// - 在调用 `finish()` 前 drop 所有 sender clone；或
+    /// - 改用 [`StreamSession::shutdown`]（立即取消并停止播放）；并通过
+    ///   [`StreamSession::cancel_handle`] 获取不持有 sender 的取消句柄。
     pub fn sender(&self) -> mpsc::Sender<String> {
         self.delta_tx.clone()
     }
@@ -110,27 +156,29 @@ impl StreamControl {
         let _ = self.llm_start.get_or_init(Instant::now);
     }
 
-    /// 中断播放并清空已排队音频（不可恢复）。
+    /// 打断当前轮次：停止播放并清空已排队音频（不可恢复）。
+    ///
+    /// 注意：该操作不会自动停止上游 LLM 流；如需“打断后立刻重新生成”的体验，
+    /// 调用方仍应同时取消旧的 LLM 流，并开始新的 StreamSession / 新一轮发送。
+    pub async fn interrupt(&self) -> Result<()> {
+        self.cancel.interrupt().await
+    }
+
+    #[deprecated(note = "Use interrupt() (pause never resumes; this is a barge-in style interrupt).")]
     pub async fn pause(&self) -> Result<()> {
-        let _ = self.pause_tx.send(true);
-        self.tts_engine.stop().await?;
-        Ok(())
+        self.interrupt().await
     }
 
     /// 取消当前流并停止播放。
     pub async fn cancel(&self) -> Result<()> {
-        let _ = self.cancel_tx.send(true);
-        self.tts_engine.stop().await?;
-        Ok(())
+        self.cancel.cancel().await
     }
 }
 
 /// Stream cancellation handle that does not keep the delta input channel open.
 #[derive(Clone)]
 pub struct StreamCancelHandle {
-    cancel_tx: watch::Sender<bool>,
-    pause_tx: watch::Sender<bool>,
-    tts_engine: Arc<dyn TtsEngine>,
+    cancel: SessionCancel,
     llm_start: Arc<OnceLock<Instant>>,
 }
 
@@ -140,18 +188,22 @@ impl StreamCancelHandle {
         let _ = self.llm_start.get_or_init(Instant::now);
     }
 
-    /// 中断播放并清空已排队音频（不可恢复）。
+    /// 打断当前轮次：停止播放并清空已排队音频（不可恢复）。
+    ///
+    /// 注意：该操作不会自动停止上游 LLM 流；如需“打断后立刻重新生成”的体验，
+    /// 调用方仍应同时取消旧的 LLM 流，并开始新的 StreamSession / 新一轮发送。
+    pub async fn interrupt(&self) -> Result<()> {
+        self.cancel.interrupt().await
+    }
+
+    #[deprecated(note = "Use interrupt() (pause never resumes; this is a barge-in style interrupt).")]
     pub async fn pause(&self) -> Result<()> {
-        let _ = self.pause_tx.send(true);
-        self.tts_engine.stop().await?;
-        Ok(())
+        self.interrupt().await
     }
 
     /// 取消当前流并停止播放。
     pub async fn cancel(&self) -> Result<()> {
-        let _ = self.cancel_tx.send(true);
-        self.tts_engine.stop().await?;
-        Ok(())
+        self.cancel.cancel().await
     }
 }
 
@@ -185,12 +237,12 @@ impl StreamSession {
         tokenizer_config: TokenizerConfig,
         pipeline_config: PipelineConfig,
     ) -> Self {
-        let task_start = Instant::now();
+        let session_start_ts = Instant::now();
         let llm_start = Arc::new(OnceLock::new());
         let (delta_tx, delta_rx) = mpsc::channel::<String>(stream_config.delta_channel);
         let (chunk_tx, chunk_rx) = mpsc::channel::<Segment>(stream_config.segment_channel);
         let (cancel_tx, cancel_rx) = watch::channel(false);
-        let (pause_tx, pause_rx) = watch::channel(false);
+        let (interrupt_tx, interrupt_rx) = watch::channel(0u64);
         let (buffer_tx, buffer_rx) = watch::channel(0u64);
 
         let buffer_engine = tts_engine.clone();
@@ -214,7 +266,7 @@ impl StreamSession {
         let pipeline = Pipeline::new(
             chunk_rx,
             cancel_rx.clone(),
-            pause_rx.clone(),
+            interrupt_rx.clone(),
             tts_engine.clone(),
             pipeline_config,
         );
@@ -224,19 +276,23 @@ impl StreamSession {
             delta_rx,
             chunk_tx,
             cancel_rx.clone(),
-            pause_rx.clone(),
+            interrupt_rx.clone(),
             buffer_rx,
-            task_start,
+            session_start_ts,
             llm_start.clone(),
             tokenizer_config,
         );
         let tokenizer_handle = tokio::spawn(tokenizer.run());
 
+        let cancel = SessionCancel {
+            cancel_tx,
+            interrupt_tx,
+            tts_engine,
+        };
+
         let control = StreamControl {
             delta_tx,
-            cancel_tx,
-            pause_tx,
-            tts_engine,
+            cancel,
             llm_start,
         };
 
@@ -254,17 +310,14 @@ impl StreamSession {
 
     pub fn cancel_handle(&self) -> StreamCancelHandle {
         StreamCancelHandle {
-            cancel_tx: self.control.cancel_tx.clone(),
-            pause_tx: self.control.pause_tx.clone(),
-            tts_engine: self.control.tts_engine.clone(),
+            cancel: self.control.cancel.clone(),
             llm_start: self.control.llm_start.clone(),
         }
     }
 
     /// 终止会话并等待后台任务结束。
     pub async fn shutdown(self) -> Result<()> {
-        let _ = self.control.cancel_tx.send(true);
-        self.control.tts_engine.stop().await?;
+        self.control.cancel.cancel().await?;
         drop(self.control.delta_tx);
         let _ = self.tokenizer_handle.await;
         let _ = self.pipeline_handle.await;
@@ -299,8 +352,7 @@ impl StreamSession {
                 res = cancel.changed(), if !cancelled => {
                     if res.is_ok() && *cancel.borrow() {
                         cancelled = true;
-                        let _ = self.control.cancel_tx.send(true);
-                        let _ = self.control.tts_engine.stop().await;
+                        self.control.cancel.cancel_best_effort().await;
                     }
                 }
                 _ = &mut self.tokenizer_handle, if !tokenizer_done => {
@@ -316,8 +368,7 @@ impl StreamSession {
         }
 
         if cancelled {
-            let _ = self.control.cancel_tx.send(true);
-            let _ = self.control.tts_engine.stop().await;
+            self.control.cancel.cancel_best_effort().await;
         }
 
         Ok(())

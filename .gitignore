@@ -13,3 +13,4 @@
 # ASR models (downloaded)
 /models/
 /asrmodel/
+v2pro/tokenizer.json

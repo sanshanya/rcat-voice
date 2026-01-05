@@ -5,9 +5,11 @@ use sherpa_rs::paraformer::{ParaformerConfig, ParaformerRecognizer};
 use sherpa_rs::sense_voice::{SenseVoiceConfig, SenseVoiceRecognizer};
 use sherpa_rs::silero_vad::{SileroVad, SileroVadConfig};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
-use tracing::info;
+use tracing::{info, warn};
+
+use crate::internal::{env, model_locator};
 
 const DEFAULT_MODELS_ROOT: &str = "models";
 const FALLBACK_MODELS_ROOT: &str = "asrmodel";
@@ -16,6 +18,7 @@ const DEFAULT_LANG: &str = "zh";
 const DEFAULT_PROVIDER: &str = "cpu";
 const DEFAULT_THREADS: i32 = 2;
 const TARGET_SAMPLE_RATE: u32 = 16_000;
+const DEFAULT_SEGMENT_QUEUE: usize = 8;
 
 const SILERO_VAD_DIR: &str = "silero_vad";
 const SILERO_VAD_FILE: &str = "silero_vad.onnx";
@@ -110,9 +113,9 @@ pub struct SherpaVadConfig {
 
 impl SherpaVadConfig {
     fn from_env(models_root: &Path) -> Result<Self> {
-        let model = match std::env::var("ASR_VAD_PATH") {
-            Ok(value) => PathBuf::from(value),
-            Err(_) => {
+        let model = match env::string("ASR_VAD_PATH") {
+            Some(value) => PathBuf::from(value),
+            None => {
                 let in_dir = models_root.join(SILERO_VAD_DIR).join(SILERO_VAD_FILE);
                 if in_dir.exists() {
                     in_dir
@@ -129,36 +132,17 @@ impl SherpaVadConfig {
             );
         }
 
-        let min_silence_duration = std::env::var("ASR_VAD_MIN_SILENCE")
-            .ok()
-            .and_then(|v| v.parse::<f32>().ok())
+        let min_silence_duration = env::get::<f32>("ASR_VAD_MIN_SILENCE")
             .unwrap_or(0.25)
             .max(0.05);
-        let min_speech_duration = std::env::var("ASR_VAD_MIN_SPEECH")
-            .ok()
-            .and_then(|v| v.parse::<f32>().ok())
-            .unwrap_or(0.1)
-            .max(0.0);
-        let max_speech_duration = std::env::var("ASR_VAD_MAX_SPEECH")
-            .ok()
-            .and_then(|v| v.parse::<f32>().ok())
+        let min_speech_duration = env::get::<f32>("ASR_VAD_MIN_SPEECH").unwrap_or(0.1).max(0.0);
+        let max_speech_duration = env::get::<f32>("ASR_VAD_MAX_SPEECH")
             .unwrap_or(30.0)
             .max(0.5);
-        let threshold = std::env::var("ASR_VAD_THRESHOLD")
-            .ok()
-            .and_then(|v| v.parse::<f32>().ok())
-            .unwrap_or(0.5)
-            .clamp(0.0, 1.0);
-        let window_size = std::env::var("ASR_VAD_WINDOW")
-            .ok()
-            .and_then(|v| v.parse::<i32>().ok())
-            .unwrap_or(512)
-            .clamp(128, 8192);
-        let buffer_size_in_seconds = std::env::var("ASR_VAD_BUFFER_SECONDS")
-            .ok()
-            .and_then(|v| v.parse::<f32>().ok())
-            .unwrap_or(100.0)
-            .clamp(1.0, 600.0);
+        let threshold = env::f32_clamped("ASR_VAD_THRESHOLD", 0.5, 0.0, 1.0);
+        let window_size = env::i32_clamped("ASR_VAD_WINDOW", 512, 128, 8192);
+        let buffer_size_in_seconds =
+            env::f32_clamped("ASR_VAD_BUFFER_SECONDS", 100.0, 1.0, 600.0);
 
         Ok(Self {
             model,
@@ -177,16 +161,19 @@ impl SherpaVadConfig {
 pub struct SherpaAsrConfig {
     pub models_root: PathBuf,
     pub model: SherpaAsrModel,
+    pub model_dtype: AsrModelDtype,
     pub lang: String,
     pub provider: String,
     pub threads: i32,
+    pub infer_log: bool,
+    pub segment_queue: usize,
+    pub vad_chunk_ms: u64,
     pub vad: SherpaVadConfig,
 }
 
 impl SherpaAsrConfig {
     pub fn from_env() -> Result<Self> {
-        let models_root = std::env::var("ASR_MODELS_ROOT")
-            .ok()
+        let models_root = env::string("ASR_MODELS_ROOT")
             .map(PathBuf::from)
             .unwrap_or_else(|| {
                 let fallback = PathBuf::from(FALLBACK_MODELS_ROOT);
@@ -197,137 +184,104 @@ impl SherpaAsrConfig {
                 }
             });
 
-        let model = std::env::var("ASR_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
+        let model = env::string("ASR_MODEL").unwrap_or_else(|| DEFAULT_MODEL.to_string());
         let model = SherpaAsrModel::parse(&model)?;
+        let model_dtype = AsrModelDtype::from_env()?;
 
-        let lang = std::env::var("ASR_LANG").unwrap_or_else(|_| DEFAULT_LANG.to_string());
-        let provider = std::env::var("ASR_PROVIDER").unwrap_or_else(|_| DEFAULT_PROVIDER.to_string());
-        let threads = std::env::var("ASR_THREADS")
-            .ok()
-            .and_then(|v| v.parse::<i32>().ok())
-            .unwrap_or(DEFAULT_THREADS)
-            .clamp(1, 32);
+        let lang = env::string("ASR_LANG").unwrap_or_else(|| DEFAULT_LANG.to_string());
+        let provider = env::string("ASR_PROVIDER").unwrap_or_else(|| DEFAULT_PROVIDER.to_string());
+        let threads = env::i32_clamped("ASR_THREADS", DEFAULT_THREADS, 1, 32);
+        let infer_log = env::bool01("ASR_INFER_LOG", false);
+        let segment_queue =
+            env::usize_clamped("ASR_SEGMENT_QUEUE", DEFAULT_SEGMENT_QUEUE, 1, 128);
+        let vad_chunk_ms = env::u64_clamped("ASR_VAD_CHUNK_MS", 20, 5, 2000);
 
         let vad = SherpaVadConfig::from_env(&models_root)?;
 
         Ok(Self {
             models_root,
             model,
+            model_dtype,
             lang,
             provider,
             threads,
+            infer_log,
+            segment_queue,
+            vad_chunk_ms,
             vad,
         })
     }
 
     fn resolve_model_paths(&self) -> Result<(PathBuf, PathBuf)> {
         match self.model {
-            SherpaAsrModel::SenseVoice
-            | SherpaAsrModel::SenseVoiceInt8
-            | SherpaAsrModel::SenseVoiceFunAsrNano
-            | SherpaAsrModel::SenseVoiceFunAsrNanoInt8 => {
-                let (base, fallback) = match self.model {
-                    SherpaAsrModel::SenseVoice | SherpaAsrModel::SenseVoiceInt8 => {
-                        (self.models_root.join(SENSEVOICE_DIR), None)
-                    }
-                    SherpaAsrModel::SenseVoiceFunAsrNano => {
-                        let fp32 = self.models_root.join(SENSEVOICE_FUNASR_NANO_DIR);
-                        let int8 = self.models_root.join(SENSEVOICE_FUNASR_NANO_INT8_DIR);
-                        let base = if fp32.exists() { fp32.clone() } else { int8.clone() };
-                        let fallback = Some(if fp32.exists() { int8 } else { fp32 });
-                        (base, fallback)
-                    }
-                    SherpaAsrModel::SenseVoiceFunAsrNanoInt8 => {
-                        let int8 = self.models_root.join(SENSEVOICE_FUNASR_NANO_INT8_DIR);
-                        let fp32 = self.models_root.join(SENSEVOICE_FUNASR_NANO_DIR);
-                        let base = if int8.exists() { int8.clone() } else { fp32.clone() };
-                        let fallback = Some(if int8.exists() { fp32 } else { int8 });
-                        (base, fallback)
-                    }
-                    _ => unreachable!("model already matched"),
-                };
-                if !base.exists() {
-                    if let Some(fallback) = fallback {
-                        bail!(
-                            "ASR model dir not found: {} (tried {})",
-                            base.display(),
-                            fallback.display()
-                        );
-                    }
-                    bail!("ASR model dir not found: {}", base.display());
-                }
-
-                let tokens = base.join(SENSEVOICE_TOKENS);
-                if !tokens.exists() {
-                    bail!("ASR tokens not found: {}", tokens.display());
-                }
-
-                let prefer_int8 = matches!(
-                    self.model,
-                    SherpaAsrModel::SenseVoiceInt8 | SherpaAsrModel::SenseVoiceFunAsrNanoInt8
-                );
-                let model = if prefer_int8 {
-                    let int8 = base.join(SENSEVOICE_MODEL_INT8);
-                    if int8.exists() {
-                        int8
-                    } else {
-                        base.join(SENSEVOICE_MODEL)
-                    }
-                } else {
-                    let fp32 = base.join(SENSEVOICE_MODEL);
-                    if fp32.exists() {
-                        fp32
-                    } else {
-                        base.join(SENSEVOICE_MODEL_INT8)
-                    }
-                };
-                if !model.exists() {
-                    bail!(
-                        "ASR model file not found: {} (expected {} or {})",
-                        model.display(),
-                        SENSEVOICE_MODEL_INT8,
-                        SENSEVOICE_MODEL
-                    );
-                }
-
-                Ok((model, tokens))
-            }
+            SherpaAsrModel::SenseVoice => resolve_sense_voice(
+                &self.models_root,
+                &[SENSEVOICE_DIR],
+                false,
+            ),
+            SherpaAsrModel::SenseVoiceInt8 => resolve_sense_voice(
+                &self.models_root,
+                &[SENSEVOICE_DIR],
+                true,
+            ),
+            SherpaAsrModel::SenseVoiceFunAsrNano => resolve_sense_voice(
+                &self.models_root,
+                &[SENSEVOICE_FUNASR_NANO_DIR, SENSEVOICE_FUNASR_NANO_INT8_DIR],
+                false,
+            ),
+            SherpaAsrModel::SenseVoiceFunAsrNanoInt8 => resolve_sense_voice(
+                &self.models_root,
+                &[SENSEVOICE_FUNASR_NANO_INT8_DIR, SENSEVOICE_FUNASR_NANO_DIR],
+                true,
+            ),
             SherpaAsrModel::ParaformerZhSmall => resolve_paraformer_dir(
                 &self.models_root.join(PARAFORMER_ZH_SMALL_2024_03_09_DIR),
+                self.model_dtype,
             ),
             SherpaAsrModel::ParaformerZh => {
-                resolve_paraformer_dir(&self.models_root.join(PARAFORMER_ZH_2024_03_09_DIR))
+                resolve_paraformer_dir(
+                    &self.models_root.join(PARAFORMER_ZH_2024_03_09_DIR),
+                    self.model_dtype,
+                )
             }
             SherpaAsrModel::ParaformerZhInt8 => resolve_paraformer_dir(
                 &self.models_root.join(PARAFORMER_ZH_INT8_2025_10_07_DIR),
+                self.model_dtype,
             ),
             SherpaAsrModel::ParaformerTrilingual => {
-                resolve_paraformer_dir(&self.models_root.join(PARAFORMER_TRILINGUAL_DIR))
+                resolve_paraformer_dir(&self.models_root.join(PARAFORMER_TRILINGUAL_DIR), self.model_dtype)
             }
             SherpaAsrModel::ParaformerEn => {
                 // voiceapi uses `sherpa-onnx-paraformer-en`, but the official archive uses
                 // `sherpa-onnx-paraformer-en-2024-03-09`. Try both for convenience.
-                let base = if self.models_root.join(PARAFORMER_EN_DIR).exists() {
-                    self.models_root.join(PARAFORMER_EN_DIR)
-                } else {
-                    self.models_root.join(PARAFORMER_EN_DIR_2024_03_09)
-                };
-                if !base.exists() {
-                    bail!(
-                        "ASR model dir not found: {} (tried {} and {})",
-                        base.display(),
-                        self.models_root.join(PARAFORMER_EN_DIR).display(),
-                        self.models_root.join(PARAFORMER_EN_DIR_2024_03_09).display()
-                    );
-                }
-
-                resolve_paraformer_dir(&base)
+                let base = model_locator::first_existing_dir(&self.models_root, "ASR model dir", &[
+                    PARAFORMER_EN_DIR,
+                    PARAFORMER_EN_DIR_2024_03_09,
+                ])?;
+                resolve_paraformer_dir(&base, self.model_dtype)
             }
         }
     }
 }
 
-fn resolve_paraformer_dir(base: &Path) -> Result<(PathBuf, PathBuf)> {
+fn resolve_sense_voice(
+    models_root: &Path,
+    dir_candidates: &[&str],
+    prefer_int8: bool,
+) -> Result<(PathBuf, PathBuf)> {
+    let base = model_locator::first_existing_dir(models_root, "ASR model dir", dir_candidates)?;
+    let tokens = model_locator::first_existing_file(&base, "ASR tokens", &[SENSEVOICE_TOKENS])?;
+
+    let model_candidates: &[&str] = if prefer_int8 {
+        &[SENSEVOICE_MODEL_INT8, SENSEVOICE_MODEL]
+    } else {
+        &[SENSEVOICE_MODEL, SENSEVOICE_MODEL_INT8]
+    };
+    let model = model_locator::first_existing_file(&base, "ASR model file", model_candidates)?;
+    Ok((model, tokens))
+}
+
+fn resolve_paraformer_dir(base: &Path, dtype: AsrModelDtype) -> Result<(PathBuf, PathBuf)> {
     if !base.exists() {
         bail!("ASR model dir not found: {}", base.display());
     }
@@ -339,7 +293,6 @@ fn resolve_paraformer_dir(base: &Path) -> Result<(PathBuf, PathBuf)> {
 
     let int8 = base.join(PARAFORMER_MODEL_INT8);
     let fp32 = base.join(PARAFORMER_MODEL);
-    let dtype = asr_model_dtype_from_env()?;
     let model = match dtype {
         AsrModelDtype::Auto => {
             if int8.exists() {
@@ -384,22 +337,34 @@ fn resolve_paraformer_dir(base: &Path) -> Result<(PathBuf, PathBuf)> {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum AsrModelDtype {
+pub enum AsrModelDtype {
     Auto,
     Int8,
     Fp32,
 }
 
-fn asr_model_dtype_from_env() -> Result<AsrModelDtype> {
-    let Ok(value) = std::env::var("ASR_MODEL_DTYPE") else {
-        return Ok(AsrModelDtype::Auto);
-    };
-    let value = value.trim().to_lowercase();
-    match value.as_str() {
-        "" | "auto" => Ok(AsrModelDtype::Auto),
-        "int8" | "i8" => Ok(AsrModelDtype::Int8),
-        "fp32" | "f32" | "float" => Ok(AsrModelDtype::Fp32),
-        other => bail!("Unknown ASR_MODEL_DTYPE: {other} (expected auto|int8|fp32)"),
+impl Default for AsrModelDtype {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
+impl AsrModelDtype {
+    fn parse(value: &str) -> Result<Self> {
+        let value = value.trim().to_lowercase();
+        match value.as_str() {
+            "auto" => Ok(Self::Auto),
+            "int8" | "i8" => Ok(Self::Int8),
+            "fp32" | "f32" | "float" => Ok(Self::Fp32),
+            other => bail!("Unknown ASR_MODEL_DTYPE: {other} (expected auto|int8|fp32)"),
+        }
+    }
+
+    fn from_env() -> Result<Self> {
+        let Some(value) = env::string("ASR_MODEL_DTYPE") else {
+            return Ok(Self::Auto);
+        };
+        Self::parse(&value)
     }
 }
 
@@ -428,6 +393,50 @@ impl SherpaRecognizer {
     }
 }
 
+fn is_sense_voice_model(model: SherpaAsrModel) -> bool {
+    matches!(
+        model,
+        SherpaAsrModel::SenseVoice
+            | SherpaAsrModel::SenseVoiceInt8
+            | SherpaAsrModel::SenseVoiceFunAsrNano
+            | SherpaAsrModel::SenseVoiceFunAsrNanoInt8
+    )
+}
+
+fn init_recognizer(config: &SherpaAsrConfig, model_path: &Path, tokens_path: &Path) -> Result<SherpaRecognizer> {
+    if is_sense_voice_model(config.model) {
+        init_sense_voice(config, model_path, tokens_path)
+    } else {
+        init_paraformer(config, model_path, tokens_path)
+    }
+}
+
+fn init_sense_voice(config: &SherpaAsrConfig, model_path: &Path, tokens_path: &Path) -> Result<SherpaRecognizer> {
+    let recognizer = SenseVoiceRecognizer::new(SenseVoiceConfig {
+        model: model_path.to_string_lossy().to_string(),
+        tokens: tokens_path.to_string_lossy().to_string(),
+        language: config.lang.clone(),
+        use_itn: true,
+        provider: Some(config.provider.clone()),
+        num_threads: Some(config.threads),
+        debug: false,
+    })
+    .map_err(|e| anyhow!("failed to init SenseVoiceRecognizer: {e}"))?;
+    Ok(SherpaRecognizer::SenseVoice(recognizer))
+}
+
+fn init_paraformer(config: &SherpaAsrConfig, model_path: &Path, tokens_path: &Path) -> Result<SherpaRecognizer> {
+    let recognizer = ParaformerRecognizer::new(ParaformerConfig {
+        model: model_path.to_string_lossy().to_string(),
+        tokens: tokens_path.to_string_lossy().to_string(),
+        provider: Some(config.provider.clone()),
+        num_threads: Some(config.threads),
+        debug: false,
+    })
+    .map_err(|e| anyhow!("failed to init ParaformerRecognizer: {e}"))?;
+    Ok(SherpaRecognizer::Paraformer(recognizer))
+}
+
 /// Streaming offline ASR with VAD segmenting (Paraformer / SenseVoice + Silero VAD).
 ///
 /// - `write_*` accepts PCM audio and pushes to an internal queue.
@@ -444,40 +453,7 @@ impl SherpaAsrStream {
     pub fn new(config: SherpaAsrConfig) -> Result<Self> {
         let (model_path, tokens_path) = config.resolve_model_paths()?;
 
-        let recognizer = match config.model {
-            SherpaAsrModel::SenseVoice
-            | SherpaAsrModel::SenseVoiceInt8
-            | SherpaAsrModel::SenseVoiceFunAsrNano
-            | SherpaAsrModel::SenseVoiceFunAsrNanoInt8 => {
-                let recognizer = SenseVoiceRecognizer::new(SenseVoiceConfig {
-                    model: model_path.to_string_lossy().to_string(),
-                    tokens: tokens_path.to_string_lossy().to_string(),
-                    language: config.lang.clone(),
-                    use_itn: true,
-                    provider: Some(config.provider.clone()),
-                    num_threads: Some(config.threads),
-                    debug: false,
-                })
-                .map_err(|e| anyhow!("failed to init SenseVoiceRecognizer: {e}"))?;
-                SherpaRecognizer::SenseVoice(recognizer)
-            }
-            SherpaAsrModel::ParaformerZhSmall
-            | SherpaAsrModel::ParaformerZh
-            | SherpaAsrModel::ParaformerZhInt8
-            | SherpaAsrModel::ParaformerTrilingual
-            | SherpaAsrModel::ParaformerEn => {
-                let recognizer = ParaformerRecognizer::new(ParaformerConfig {
-                    model: model_path.to_string_lossy().to_string(),
-                    tokens: tokens_path.to_string_lossy().to_string(),
-                    provider: Some(config.provider.clone()),
-                    num_threads: Some(config.threads),
-                    debug: false,
-                })
-                .map_err(|e| anyhow!("failed to init ParaformerRecognizer: {e}"))?;
-                SherpaRecognizer::Paraformer(recognizer)
-            }
-        };
-        let recognizer = Arc::new(StdMutex::new(recognizer));
+        let recognizer = init_recognizer(&config, &model_path, &tokens_path)?;
 
         let vad_cfg = SileroVadConfig {
             model: config.vad.model.to_string_lossy().to_string(),
@@ -497,63 +473,58 @@ impl SherpaAsrStream {
         let (tx, mut in_rx) = mpsc::channel::<InputMsg>(64);
         let (out_tx, rx) = mpsc::channel::<AsrSegment>(64);
 
+        let log_infer = config.infer_log;
+        let segment_queue = config.segment_queue;
+        let vad_chunk_ms = config.vad_chunk_ms;
+        let vad_chunk_samples = ((TARGET_SAMPLE_RATE as u64 * vad_chunk_ms) / 1000).max(1) as usize;
+
         let join = tokio::spawn(async move {
-            let log_infer = std::env::var("ASR_INFER_LOG")
-                .ok()
-                .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
-            let vad_chunk_ms = std::env::var("ASR_VAD_CHUNK_MS")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(20)
-                .clamp(5, 2000);
-            let vad_chunk_samples =
-                ((TARGET_SAMPLE_RATE as u64 * vad_chunk_ms) / 1000).max(1) as usize;
-            let mut idx = 0usize;
+
+            let (segment_tx, segment_rx) = mpsc::channel::<VadSegment>(segment_queue);
+            let infer_handle = tokio::task::spawn_blocking(move || {
+                run_inference_loop(recognizer, segment_rx, out_tx, log_infer);
+            });
+
+            let mut dropped_segments: u64 = 0;
+            let mut last_drop_log = Instant::now();
+            let mut stop = false;
             while let Some(msg) = in_rx.recv().await {
                 match msg {
                     InputMsg::Samples(samples) => {
                         if samples.is_empty() {
                             continue;
                         }
-                        if samples.len() <= vad_chunk_samples {
-                            vad.accept_waveform(&samples);
-                            if process_vad_segments(
+                        for chunk in samples.chunks(vad_chunk_samples) {
+                            vad.accept_waveform(chunk);
+                            if enqueue_vad_segments(
                                 &mut vad,
-                                &recognizer,
-                                &out_tx,
-                                &mut idx,
-                                log_infer,
-                            )
-                            .await
-                            {
+                                &segment_tx,
+                                &mut dropped_segments,
+                                &mut last_drop_log,
+                            ) {
+                                stop = true;
                                 break;
-                            }
-                        } else {
-                            for chunk in samples.chunks(vad_chunk_samples) {
-                                vad.accept_waveform(chunk);
-                                if process_vad_segments(
-                                    &mut vad,
-                                    &recognizer,
-                                    &out_tx,
-                                    &mut idx,
-                                    log_infer,
-                                )
-                                .await
-                                {
-                                    return;
-                                }
                             }
                         }
                     }
                     InputMsg::End => {
                         vad.flush();
-                        let _ =
-                            process_vad_segments(&mut vad, &recognizer, &out_tx, &mut idx, log_infer)
-                                .await;
+                        let _ = enqueue_vad_segments(
+                            &mut vad,
+                            &segment_tx,
+                            &mut dropped_segments,
+                            &mut last_drop_log,
+                        );
                         break;
                     }
                 }
+                if stop {
+                    break;
+                }
             }
+
+            drop(segment_tx);
+            let _ = infer_handle.await;
         });
 
         info!("asr: sherpa stream started (target_sr={TARGET_SAMPLE_RATE})");
@@ -657,12 +628,18 @@ impl Drop for SherpaAsrStream {
     }
 }
 
-async fn process_vad_segments(
+#[derive(Debug)]
+struct VadSegment {
+    samples: Vec<f32>,
+    start: f32,
+    end: f32,
+}
+
+fn enqueue_vad_segments(
     vad: &mut SileroVad,
-    recognizer: &Arc<StdMutex<SherpaRecognizer>>,
-    out_tx: &mpsc::Sender<AsrSegment>,
-    idx: &mut usize,
-    log_infer: bool,
+    segment_tx: &mpsc::Sender<VadSegment>,
+    dropped_segments: &mut u64,
+    last_drop_log: &mut Instant,
 ) -> bool {
     while !vad.is_empty() {
         let segment = vad.front();
@@ -675,33 +652,47 @@ async fn process_vad_segments(
         let start_samples = segment.start.max(0) as usize;
         let start = start_samples as f32 / TARGET_SAMPLE_RATE as f32;
         let end = (start_samples + segment.samples.len()) as f32 / TARGET_SAMPLE_RATE as f32;
-        let samples = segment.samples;
-        let recognizer = recognizer.clone();
-
-        let result = tokio::task::spawn_blocking(move || {
-            let mut guard = recognizer
-                .lock()
-                .map_err(|_| anyhow!("sherpa recognizer lock poisoned"))?;
-            let infer_start = std::time::Instant::now();
-            let text = guard.transcribe(TARGET_SAMPLE_RATE, &samples);
-            let infer_ms = infer_start.elapsed().as_millis() as u64;
-            Ok::<_, anyhow::Error>((text, infer_ms))
-        })
-        .await;
-
-        let (result, infer_ms) = match result {
-            Ok(Ok(r)) => r,
-            Ok(Err(e)) => {
-                tracing::warn!("asr: transcribe failed: {e}");
-                continue;
-            }
-            Err(e) => {
-                tracing::warn!("asr: transcribe task failed: {e}");
-                continue;
-            }
+        let segment = VadSegment {
+            samples: segment.samples,
+            start,
+            end,
         };
 
-        let text = result.trim().to_string();
+        match segment_tx.try_send(segment) {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                return true;
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                *dropped_segments = dropped_segments.saturating_add(1);
+                let now = Instant::now();
+                if now.duration_since(*last_drop_log) >= Duration::from_secs(1) {
+                    warn!(
+                        "asr: dropped {} segments (segment queue full)",
+                        *dropped_segments
+                    );
+                    *dropped_segments = 0;
+                    *last_drop_log = now;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn run_inference_loop(
+    mut recognizer: SherpaRecognizer,
+    mut segment_rx: mpsc::Receiver<VadSegment>,
+    out_tx: mpsc::Sender<AsrSegment>,
+    log_infer: bool,
+) {
+    let mut idx: usize = 0;
+    while let Some(segment) = segment_rx.blocking_recv() {
+        let infer_start = Instant::now();
+        let text = recognizer.transcribe(TARGET_SAMPLE_RATE, &segment.samples);
+        let infer_ms = infer_start.elapsed().as_millis() as u64;
+
+        let text = text.trim().to_string();
         if text.is_empty() {
             continue;
         }
@@ -709,23 +700,22 @@ async fn process_vad_segments(
         if log_infer {
             info!(
                 "asr: segment idx={} start={:.2}s end={:.2}s infer_ms={}",
-                *idx, start, end, infer_ms
+                idx, segment.start, segment.end, infer_ms
             );
         }
 
-        let seg_idx = *idx;
         let seg = AsrSegment {
             text,
             finished: true,
-            idx: seg_idx,
-            start,
-            end,
+            idx,
+            start: segment.start,
+            end: segment.end,
             channel: None,
         };
-        *idx = idx.saturating_add(1);
-        if out_tx.send(seg).await.is_err() {
-            return true;
+        idx = idx.saturating_add(1);
+
+        if out_tx.blocking_send(seg).is_err() {
+            break;
         }
     }
-    false
 }
