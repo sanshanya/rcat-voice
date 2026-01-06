@@ -1,3 +1,4 @@
 /target
 /v2pro/**/*.pt
 /onnx/**/*.onnx
+/asrmodel
