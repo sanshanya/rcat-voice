@@ -1,4 +1,4 @@
-use crate::audio::{AudioBackend, CancelScope, CancelToken, SegmentPlayback};
+use crate::audio::{AudioBackend, AudioStreamSegment, CancelScope, CancelToken, SegmentPlayback};
 use super::{Result, SynthesizedAudio, TtsEngine, TtsMetrics};
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
@@ -324,24 +324,15 @@ fn play_chunks(
     audio: &dyn AudioBackend,
     cancel: &CancelScope,
 ) -> (Option<Instant>, Instant, SegmentPlayback) {
-    let mut first_audio_ts: Option<Instant> = None;
-    let mut segment = audio.begin_segment();
+    let mut segment = AudioStreamSegment::new(audio);
     for chunk in samples.chunks(chunk_samples) {
-        if cancel.is_cancelled() {
+        if !segment.push(chunk, cancel) {
             break;
-        }
-        let written = segment.push(chunk, cancel);
-        if written == 0 {
-            continue;
-        }
-        if first_audio_ts.is_none() {
-            first_audio_ts = segment.first_audio_ts();
         }
     }
 
     let gen_done_ts = Instant::now();
-    let playback = segment.finish(cancel.is_cancelled());
-    let first_audio_ts = first_audio_ts.or(playback.first_audio_ts);
+    let (first_audio_ts, playback) = segment.finish(cancel.is_cancelled());
     (first_audio_ts, gen_done_ts, playback)
 }
 

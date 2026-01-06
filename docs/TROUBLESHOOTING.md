@@ -17,7 +17,14 @@
 **最稳妥方案（推荐）**
 
 - **应用内（例如 Tauri）优先使用 `gpt-sovits-onnx`**（不加载 libtorch），将 GPU TTS 留给独立进程：
-  - 进程隔离 worker（本机 IPC）或 remote TTS（HTTP，OpenAI 风格接口）。
+  - 进程隔离 worker（本机 HTTP，OpenAI 风格接口 `/v1/audio/speech`）。
+
+本仓库内置了一个最小 worker（流式 `pcm16le`）：
+
+```powershell
+cd rcat-voice
+cargo run --bin tts_worker --features tts-worker --release
+```
 
 **可尝试的缓解（不保证）**
 
@@ -57,5 +64,6 @@
 - 打开 GPT-SoVITS 上游库 debug（用于看到真实 TorchScript 错误）：
   - `RUST_LOG=gpt_sovits_rs=debug`
 - 打开本项目的文本/流式指标：
-  - `GSV_TEXT_METRICS=1`
-
+  - `VOICE_TTS_METRICS=1`（推荐，总开关；也会联动开启 `GSV_TEXT_METRICS`）
+  - `TTS_WORKER_METRICS=1`（仅 worker 进程请求指标）
+  - `GSV_TEXT_METRICS=1`（仅 GPT-SoVITS 文本/推理阶段）

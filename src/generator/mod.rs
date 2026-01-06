@@ -3,7 +3,6 @@ use async_trait::async_trait;
 use std::sync::Arc;
 use tokio::sync::oneshot;
 use tokio::time::Instant;
-use tracing::warn;
 
 use crate::audio::AudioBackend;
 use crate::internal::env;
@@ -140,7 +139,6 @@ pub fn build_from_env() -> Result<Arc<dyn TtsEngine>> {
         "gpt-sovits" => build_gpt_sovits_from_env(),
         "gpt-sovits-onnx" => build_gpt_sovits_onnx_from_env(),
         "remote" => {
-            warn!("TTS_BACKEND=remote selected, but RemoteTts is not implemented yet.");
             Ok(Arc::new(RemoteTts::new()?))
         }
         _ => bail!("Unknown TTS_BACKEND: {backend}"),

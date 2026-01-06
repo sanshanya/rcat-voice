@@ -306,12 +306,44 @@ cargo run --example voice_assistant --features asr-sherpa,asr-mic,turn-smart,gpt
 如需运行时切换后端，编译时可改用 `--all-features`。
 使用 ONNX 后端时，将特性替换为 `gpt-sovits-onnx` 并设置 `TTS_BACKEND=gpt-sovits-onnx`。
 
+## CUDA GPT-SoVITS（进程隔离 / HTTP，本机流式 PCM）
+
+在 Windows 上若宿主进程同时混用 libtorch/CUDA 与 ONNX Runtime（如 Tauri + `asr-sherpa`/`turn-smart`），可能触发 `0xc0000374 STATUS_HEAP_CORRUPTION`。
+推荐把 CUDA GPT-SoVITS 放到独立进程中，通过 OpenAI 风格的 `/v1/audio/speech` 接口拉取 **流式 `pcm16le`**。
+
+> WAV 理论上可以“边发边播”，但标准 WAV header 需要 data size，实际兼容性很差；这里直接流式输出 `pcm16le`。
+
+启动本机 worker（同一台机器上另开终端）：
+
+```powershell
+cd rcat-voice
+
+$env:LIBTORCH="C:\libtorch"
+$env:Path="$env:LIBTORCH\lib;$env:Path"
+$env:LIBTORCH_BYPASS_VERSION_CHECK="1"   # 可选
+
+$env:GSV_MODEL_DIR="v2pro"
+$env:TTS_WORKER_BIND="127.0.0.1:7878"
+
+cargo run --bin tts_worker --features tts-worker --release
+```
+
+在客户端进程里使用远端后端（仍然走本机音频播放）：
+
+```powershell
+$env:TTS_BACKEND="remote"
+$env:TTS_REMOTE_BASE_URL="http://127.0.0.1:7878"
+$env:AUDIO_BACKEND="rodio"
+$env:AUDIO_SAMPLE_RATE="32000"
+$env:AUDIO_CHANNELS="1"
+```
+
 ## 结构说明
 
 - `src/streaming.rs`：`StreamSession` / `StreamControl`（会话与控制）
 - `src/tokenizer.rs`：分段与 relax
 - `src/pipeline.rs`：TTS 调度与播放指标
-- `src/generator/`：TTS 后端（`gpt-sovits` / `gpt-sovits-onnx` / `os` / `remote` 占位）
+- `src/generator/`：TTS 后端（`gpt-sovits` / `gpt-sovits-onnx` / `os` / `remote`）
 - `src/audio/`：音频后端（`rodio` / `wasapi` 占位 / `system` 占位）
 - `src/asr/`：ASR（目前：`asr-sherpa` / SenseVoice + Silero VAD）
 - `src/turn/`：Turn detection（可选：Smart Turn ONNX）
@@ -334,6 +366,26 @@ cargo run --example voice_assistant --features asr-sherpa,asr-mic,turn-smart,gpt
 - `TTS_BACKLOG_LIMIT`：并行合成的排队上限（默认 `32`；满则对上游施加背压）
 - `TTS_SYNTH_TIMEOUT_MS`：单段合成超时（默认 `30000`；`0`=关闭；超时会跳过该段以避免卡死）
 - `AUDIO_BACKEND`：`rodio`（默认）
+
+### Remote（OpenAI 风格 `/v1/audio/speech`）
+
+- `TTS_REMOTE_BASE_URL`：远端 base url（默认 `http://127.0.0.1:7878`）
+  - 实际请求：`{TTS_REMOTE_BASE_URL}/v1/audio/speech`
+- `TTS_REMOTE_API_KEY`：可选 Bearer token
+- `TTS_REMOTE_MODEL`：默认 `gpt-sovits`
+- `TTS_REMOTE_VOICE`：默认 `default`
+- `TTS_MODEL` / `TTS_VOICE` / `TTS_API_KEY`：以上变量的通用别名（若你希望统一命名）
+
+### Worker（本机 HTTP）
+
+- `TTS_WORKER_BIND`：监听地址（默认 `127.0.0.1:7878`）
+
+### 指标与日志
+
+- `VOICE_TTS_METRICS=1`：打印分段/首播/播放完成等时间线指标；并联动开启 GPT-SoVITS 的文本前处理与 `next_chunk` 耗时日志（等价于 `GSV_TEXT_METRICS=1`）
+- `TTS_WORKER_METRICS=1`：worker 进程打印每次请求的 ttfb/gen/rtf 等指标
+- `VOICE_STREAM_METRICS=1` / `STREAM_METRICS=1`：仅控制时间线指标打印（与 `VOICE_TTS_METRICS` 类似）
+- `RUST_LOG=...`：日志过滤（例如 `RUST_LOG=info,rcat_voice=info,gpt_sovits_rs=debug`）
 
 ### Audio（rodio）
 

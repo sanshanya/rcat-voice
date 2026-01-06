@@ -64,6 +64,50 @@ pub trait SegmentWriter: Send {
     fn first_audio_ts(&self) -> Option<Instant>;
 }
 
+/// Helper for streaming/queued audio writes that tracks first-audio timestamp.
+pub struct AudioStreamSegment {
+    segment: Box<dyn SegmentWriter>,
+    first_audio_ts: Option<Instant>,
+}
+
+impl AudioStreamSegment {
+    pub fn new(audio: &dyn AudioBackend) -> Self {
+        Self {
+            segment: audio.begin_segment(),
+            first_audio_ts: None,
+        }
+    }
+
+    /// Push a chunk of samples into the segment. Returns `false` when playback should stop.
+    pub fn push(&mut self, samples: &[f32], cancel: &CancelScope) -> bool {
+        if cancel.is_cancelled() {
+            return false;
+        }
+        if samples.is_empty() {
+            return true;
+        }
+
+        let written = self.segment.push(samples, cancel);
+        if written == 0 {
+            return false;
+        }
+        if self.first_audio_ts.is_none() {
+            self.first_audio_ts = self.segment.first_audio_ts();
+        }
+        true
+    }
+
+    pub fn finish(self, cancelled: bool) -> (Option<Instant>, SegmentPlayback) {
+        let Self {
+            segment,
+            first_audio_ts,
+        } = self;
+        let playback = segment.finish(cancelled);
+        let first_audio_ts = first_audio_ts.or(playback.first_audio_ts);
+        (first_audio_ts, playback)
+    }
+}
+
 /// 流式播放的音频后端抽象。
 pub trait AudioBackend: Send + Sync {
     /// 开始一个新的片段写入。

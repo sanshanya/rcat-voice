@@ -210,7 +210,7 @@ impl Tokenizer {
         let relax_buffer_ms = self.config.relax_buffer_ms;
         let relax_log = self.config.relax_log;
         let mut relax_active = false;
-        loop {
+        'run: loop {
             tokio::select! {
                 res = self.cancel_rx.changed(), if !cancel_closed => {
                     if res.is_err() {
@@ -232,68 +232,76 @@ impl Tokenizer {
                     eager_chunks_remaining = eager_chunks_default;
                 }
                 maybe = self.delta_rx.recv() => {
-                    let Some(delta) = maybe else {
-                        let pending = std::mem::take(&mut buf);
-                        let _ = self
-                            .emit_segment(pending, &mut first, first_delta_ts, last_delta_ts)
-                            .await;
-                        break;
-                    };
+                    let is_eof = maybe.is_none();
+                    if let Some(delta) = maybe {
+                        // Capture time of first token
+                        if first && first_delta_ts.is_none() {
+                            first_delta_ts = Some(Instant::now());
+                        }
+                        last_delta_ts = Some(Instant::now());
 
-                    // Capture time of first token
-                    if first && first_delta_ts.is_none() {
-                        first_delta_ts = Some(Instant::now());
+                        buf.push_str(&delta);
                     }
-                    last_delta_ts = Some(Instant::now());
 
-                    buf.push_str(&delta);
+                    if is_eof && buf.is_empty() {
+                        break 'run;
+                    }
 
-                    let mut buffered_ms_for_log: Option<u64> = None;
-                    let (thresholds, relax_now) = if eager_chunks_remaining > 0 {
-                        (eager_thresholds, false)
-                    } else {
-                        let buffered_ms = *self.buffer_ms_rx.borrow();
-                        buffered_ms_for_log = Some(buffered_ms);
-                        let relax_now = relax_buffer_ms > 0 && buffered_ms >= relax_buffer_ms;
-                        let thresholds = if relax_now {
-                            relax_thresholds
+                    loop {
+                        let mut buffered_ms_for_log: Option<u64> = None;
+                        let (thresholds, relax_now) = if eager_chunks_remaining > 0 {
+                            (eager_thresholds, false)
                         } else {
-                            normal_thresholds
+                            let buffered_ms = *self.buffer_ms_rx.borrow();
+                            buffered_ms_for_log = Some(buffered_ms);
+                            let relax_now = relax_buffer_ms > 0 && buffered_ms >= relax_buffer_ms;
+                            let thresholds = if relax_now {
+                                relax_thresholds
+                            } else {
+                                normal_thresholds
+                            };
+                            (thresholds, relax_now)
                         };
-                        (thresholds, relax_now)
-                    };
-                    let (min_c, soft_max, hard_max) = (
-                        thresholds.min_chars,
-                        thresholds.soft_max,
-                        thresholds.hard_max,
-                    );
-                    if relax_log && relax_now != relax_active {
-                        let buffered_ms = buffered_ms_for_log
-                            .unwrap_or_else(|| *self.buffer_ms_rx.borrow());
-                        log_relax_transition(
-                            relax_now,
-                            &mut relax_active,
-                            buffered_ms,
-                            (min_c, soft_max, hard_max),
+                        let (min_c, soft_max, hard_max) = (
+                            thresholds.min_chars,
+                            thresholds.soft_max,
+                            thresholds.hard_max,
                         );
-                    }
-                    if let Some(cut_idx) = find_flush_index(
-                        &buf,
-                        min_c,
-                        soft_max,
-                        hard_max,
-                    ) {
+                        if relax_log && relax_now != relax_active {
+                            let buffered_ms = buffered_ms_for_log
+                                .unwrap_or_else(|| *self.buffer_ms_rx.borrow());
+                            log_relax_transition(
+                                relax_now,
+                                &mut relax_active,
+                                buffered_ms,
+                                (min_c, soft_max, hard_max),
+                            );
+                        }
+
+                        let Some(cut_idx) = find_flush_index(&buf, min_c, soft_max, hard_max) else {
+                            if is_eof {
+                                let pending = std::mem::take(&mut buf);
+                                let _ = self
+                                    .emit_segment(pending, &mut first, first_delta_ts, last_delta_ts)
+                                    .await;
+                            }
+                            break;
+                        };
                         let remaining = buf.split_off(cut_idx);
                         let pending = std::mem::replace(&mut buf, remaining);
                         if !self
                             .emit_segment(pending, &mut first, first_delta_ts, last_delta_ts)
                             .await
                         {
-                            break;
+                            break 'run;
                         }
                         if eager_chunks_remaining > 0 {
                             eager_chunks_remaining -= 1;
                         }
+                    }
+
+                    if is_eof {
+                        break 'run;
                     }
                 }
             }
@@ -411,6 +419,8 @@ fn scan_boundaries(s: &str, hard_max: usize) -> BoundaryScan {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, OnceLock};
+    use tokio::time::{Duration, timeout};
 
     #[test]
     fn flush_requires_min_chars() {
@@ -460,5 +470,51 @@ mod tests {
         let s2 = "ab,xxxxxxxxxxxxxxxxx";
         let idx2 = find_flush_index(s2, 5, 10, 20);
         assert_eq!(idx2, Some(20));
+    }
+
+    #[tokio::test]
+    async fn tokenizer_flushes_multiple_segments_from_single_delta() {
+        let (delta_tx, delta_rx) = tokio::sync::mpsc::channel::<String>(8);
+        let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::channel::<Segment>(8);
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let (_interrupt_tx, interrupt_rx) = tokio::sync::watch::channel(0u64);
+        let (_buffer_tx, buffer_rx) = tokio::sync::watch::channel(0u64);
+
+        let session_start_ts = Instant::now();
+        let llm_start = Arc::new(OnceLock::new());
+        let tokenizer = Tokenizer::new(
+            delta_rx,
+            chunk_tx,
+            cancel_rx,
+            interrupt_rx,
+            buffer_rx,
+            session_start_ts,
+            llm_start,
+            TokenizerConfig {
+                eager_chunks: 0,
+                relax_buffer_ms: 0,
+                relax_log: false,
+            },
+        );
+
+        let handle = tokio::spawn(tokenizer.run());
+
+        delta_tx
+            .send("这是第一句很长很长很长！这是第二句也很长很长很长！这是第三句也很长很长很长！这是第四句也很长很长很长！".to_string())
+            .await
+            .unwrap();
+
+        let first = timeout(Duration::from_millis(1000), chunk_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let second = timeout(Duration::from_millis(1000), chunk_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(first.text, second.text);
+
+        drop(delta_tx);
+        let _ = handle.await;
     }
 }
