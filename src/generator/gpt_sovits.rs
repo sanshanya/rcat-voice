@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::time::Instant;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::internal::{env, model_locator, timing};
 
@@ -164,12 +164,34 @@ fn build_inner(config: &GptSovitsConfig, device: tch::Device) -> Result<Inner> {
         .to_device(device)
         .unsqueeze(0);
     let ref_audio_32k = if fp16 { to_half(ref_audio_32k) } else { ref_audio_32k };
+    if config.log_text_metrics {
+        info!(
+            "gpt-sovits dtype: ref_audio_32k={:?} device={:?}",
+            ref_audio_32k.kind(),
+            ref_audio_32k.device()
+        );
+    }
 
     let _g = tch::no_grad_guard();
     let (prompts, refer, sv_emb) = speaker.pre_handle_ref(ref_audio_32k)?;
+    if config.log_text_metrics {
+        info!(
+            "gpt-sovits dtype: prompts={:?} refer={:?} sv_emb={:?}",
+            prompts.kind(),
+            refer.kind(),
+            sv_emb.kind()
+        );
+    }
 
     let (ref_seq, ref_bert) = gpt_sovits_rs::text::get_phone_and_bert(&g2p, &config.ref_text)?;
     let ref_bert = if fp16 { to_half(ref_bert) } else { to_float(ref_bert) };
+    if config.log_text_metrics {
+        info!(
+            "gpt-sovits dtype: ref_seq={:?} ref_bert={:?}",
+            ref_seq.kind(),
+            ref_bert.kind()
+        );
+    }
 
     Ok(Inner {
         g2p,
@@ -270,6 +292,33 @@ impl GptSovitsConfig {
     }
 
     fn apply_env_overrides(&mut self) {
+        if let Ok(raw) = std::env::var("GSV_FP16") {
+            let normalized = raw.trim().to_lowercase();
+            let parsed = match normalized.as_str() {
+                "1" | "true" | "yes" | "y" | "on" => Some(true),
+                "0" | "false" | "no" | "n" | "off" => Some(false),
+                _ => None,
+            };
+            match parsed {
+                Some(value) => {
+                    self.fp16 = value;
+                    info!("GSV_FP16={} -> fp16={}", raw.trim(), value);
+                    if !value {
+                        info!(
+                            "GSV_FP16=0: using fp32 inputs (note: some CUDA TorchScript models may be half-only; enable RUST_LOG=gpt_sovits_rs=debug for details)"
+                        );
+                    }
+                }
+                None => {
+                    warn!(
+                        "GSV_FP16={:?} is invalid; expected 1/0/true/false; using default fp16={}",
+                        raw,
+                        self.fp16
+                    );
+                }
+            }
+        }
+
         if let Some(parsed) = env::get::<i64>("GSV_TOP_K") {
             self.top_k = parsed.clamp(1, 50);
         }
@@ -450,6 +499,7 @@ fn run_stream_infer(
     );
     let mut first_chunk_gen_logged = false;
     let mut first_chunk_io_logged = false;
+    let mut samples_buf: Vec<f32> = Vec::new();
     while !cancel_scope.is_cancelled() {
         let chunk_start =
             (!first_chunk_gen_logged && inner.log_text_metrics).then_some(Instant::now());
@@ -471,10 +521,10 @@ fn run_stream_infer(
         let io_start =
             (!first_chunk_io_logged && inner.log_text_metrics).then_some(Instant::now());
         let audio_cpu = audio.f_to_device(tch::Device::Cpu)?.contiguous();
-        let mut samples = vec![0f32; audio_size];
-        audio_cpu.f_copy_data(&mut samples, audio_size)?;
+        samples_buf.resize(audio_size, 0.0);
+        audio_cpu.f_copy_data(&mut samples_buf, audio_size)?;
 
-        let accepted = sink.on_chunk(&samples, cancel_scope)?;
+        let accepted = sink.on_chunk(&samples_buf, cancel_scope)?;
         if accepted {
             if let Some(start) = io_start {
                 let elapsed = start.elapsed();

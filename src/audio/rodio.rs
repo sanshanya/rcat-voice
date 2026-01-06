@@ -37,7 +37,19 @@ struct RodioSegmentWriter {
 impl RodioSegmentWriter {
     fn ts_at_sample(&self, stream_start: Instant, sample_idx: u64) -> Instant {
         let samples_per_second = self.inner.sample_rate as f64 * self.inner.channels as f64;
-        stream_start + Duration::from_secs_f64(sample_idx as f64 / samples_per_second)
+        if samples_per_second <= 0.0 {
+            return stream_start;
+        }
+
+        let played = self.inner.playback.played();
+        let consumed = self.inner.playback.consumed();
+        let gap = played.saturating_sub(consumed);
+        let mut wall_sample_idx = sample_idx.saturating_add(gap);
+        if wall_sample_idx < played {
+            wall_sample_idx = played;
+        }
+
+        stream_start + Duration::from_secs_f64(wall_sample_idx as f64 / samples_per_second)
     }
 
     fn estimate_first_audio_ts(&self, stream_start: Instant) -> Option<Instant> {
@@ -278,6 +290,14 @@ impl PlaybackState {
 
     fn on_write(&self, samples: u64) {
         let _ = self.written_samples.fetch_add(samples, Ordering::AcqRel);
+    }
+
+    fn consumed(&self) -> u64 {
+        self.consumed_samples.load(Ordering::Acquire)
+    }
+
+    fn played(&self) -> u64 {
+        self.played_samples.load(Ordering::Acquire)
     }
 
     fn written(&self) -> u64 {

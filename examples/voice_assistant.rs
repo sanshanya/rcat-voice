@@ -51,8 +51,10 @@ async fn main() -> Result<()> {
     use std::time::Instant;
     use tokio::time::{Duration, MissedTickBehavior};
     use tracing::{debug, info, warn};
+    use tracing_subscriber::EnvFilter;
 
-    tracing_subscriber::fmt().with_env_filter("info").init();
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
 
     let base_url = Arc::new(
         std::env::var("OPENAI_BASE_URL")

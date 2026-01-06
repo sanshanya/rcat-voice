@@ -1,6 +1,9 @@
 #[cfg(feature = "asr-sherpa")]
 use anyhow::{Context, Result, bail};
 
+#[cfg(feature = "asr-sherpa")]
+use tracing_subscriber::EnvFilter;
+
 #[cfg(not(feature = "asr-sherpa"))]
 fn main() {
     eprintln!("This example requires `--features asr-sherpa`");
@@ -9,7 +12,8 @@ fn main() {
 #[cfg(feature = "asr-sherpa")]
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt().with_env_filter("info").init();
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
 
     let metrics = std::env::var("ASR_METRICS")
         .ok()

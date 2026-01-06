@@ -100,6 +100,8 @@ cargo run --example stream_sim --features gpt-sovits
 - PowerShell：`$env:GSV_TEXT_METRICS="1"`
 - bash：`GSV_TEXT_METRICS=1 cargo run --example stream_sim --features gpt-sovits`
 
+如果你在 Windows 上同时启用 `gpt-sovits`（libtorch）和 `turn-smart`/`asr-sherpa`（ONNX Runtime），遇到 `STATUS_HEAP_CORRUPTION` 或 OpenMP 运行时冲突，可尝试在启动前设置：`$env:KMP_DUPLICATE_LIB_OK="TRUE"`。
+
 ## 快速开始（CPU ONNX GPT-SoVITS）
 
 1) 按 `gpt-sovits-onnx-rs` 的 `scripts/README.md` 转换模型，得到 ONNX 模型目录。
@@ -354,6 +356,7 @@ cargo run --example voice_assistant --features asr-sherpa,asr-mic,turn-smart,gpt
 ### GPT-SoVITS
 
 - `GSV_MODEL_DIR`：模型目录（默认 `v2pro`）
+- `GSV_FP16`：`1`/`0`（默认 `1`；设为 `0` 时使用 fp32 输入张量；若 CUDA TorchScript 权重为 half-only 可能会报错，可配合 `RUST_LOG=gpt_sovits_rs=debug` 查看真实原因）
 - `GSV_TOP_K`：解码 top-k（默认 15）
 - `GSV_FIRST_TOP_K`：首段 top-k（默认 12）
 - `GSV_FIRST_CHUNK_TOKENS`：每段首块音频 token 目标（默认 10，clamp 3-25）
@@ -366,6 +369,13 @@ cargo run --example voice_assistant --features asr-sherpa,asr-mic,turn-smart,gpt
 - `GSV_FIRST_CHUNK_MID_CHARS`：中句阈值（默认 24）
 - `GSV_FIRST_CHUNK_SHORT_TOKENS`：短句首块 token（默认 6）
 - `GSV_FIRST_CHUNK_MID_TOKENS`：中句首块 token（默认 8）
+
+### Windows（libtorch + ONNX Runtime）
+
+- `KMP_DUPLICATE_LIB_OK=TRUE`：当同时使用 `gpt-sovits`（libtorch）与 `asr-sherpa`/`turn-smart`（ONNX Runtime）时，若遇到 OpenMP 运行时冲突或 `STATUS_HEAP_CORRUPTION`，可尝试设置该环境变量（权衡：可能影响性能/线程配置）。
+- `SHERPA_STATIC_CRT=0`：仅影响 **编译阶段**。当启用 `asr-sherpa` 时，建议在 Windows 上使用动态 CRT 以降低与其它原生库（如 libtorch）混用时的崩溃概率；修改后需 `cargo clean -p sherpa-rs-sys` 重新构建。
+- `SHERPA_FORCE_BUILD=1`：仅影响 **编译阶段**。跳过下载 sherpa-onnx 预编译包，强制走本地 CMake 构建（用于规避某些预编译二进制与 libtorch 混用不稳定的问题；需要本机具备 CMake + MSVC 工具链）。
+- `SHERPA_ONNX_SRC`：仅影响 **编译阶段**。当 `SHERPA_FORCE_BUILD=1` 时，指定本机 `sherpa-onnx` 源码根目录（需包含 `CMakeLists.txt`）；本仓库内置的 `vendor/sherpa-rs/sherpa-rs-sys/sherpa-onnx/` 仅包含 C 头文件，无法直接用于 CMake 构建。
 
 ### GPT-SoVITS ONNX
 

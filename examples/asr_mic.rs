@@ -27,8 +27,10 @@ async fn main() -> Result<()> {
     use std::time::Instant;
     use tokio::time::{Duration, MissedTickBehavior};
     use tracing::{info, warn};
+    use tracing_subscriber::EnvFilter;
 
-    tracing_subscriber::fmt().with_env_filter("info").init();
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
 
     let feed_ms = std::env::var("ASR_FEED_MS")
         .ok()

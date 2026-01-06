@@ -7,7 +7,7 @@ edition = "2024"
 anyhow = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util", "signal", "io-std"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "tracing-log"] }
 async-trait = "0.1"
 crossbeam-queue = "0.3"
 rand_core = { version = "=0.10.0-rc-2", default-features = false }
