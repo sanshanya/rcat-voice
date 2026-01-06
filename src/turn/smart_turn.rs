@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use crate::asr::utils::{LinearResampler, pcm_i16_to_mono_f32};
-use crate::internal::{env, model_locator};
+use crate::internal::env;
 
 const WINDOW_SECONDS: usize = 8;
 
@@ -52,6 +52,21 @@ impl SmartTurnModel {
         }
         if !is_model_path(model) {
             bail!("SMART_TURN_MODEL must point to a .onnx file, got: {}", model.display());
+        }
+
+        #[cfg(all(target_os = "windows", feature = "gpt-sovits"))]
+        {
+            if is_smart_turn_cpu_model_path(model)
+                && is_gpt_sovits_backend_selected()
+                && !env::bool01("SMART_TURN_ALLOW_CPU_MODEL", false)
+            {
+                bail!(
+                    "SMART_TURN_MODEL is set to a CPU smart-turn model ({}) while TTS_BACKEND=gpt-sovits.\n\
+This combination has been observed to crash on Windows (STATUS_HEAP_CORRUPTION 0xc0000374).\n\
+Fix: switch to `smart-turn-*-gpu.onnx`, or set `SMART_TURN_ALLOW_CPU_MODEL=1` to force CPU anyway.",
+                    model.display()
+                );
+            }
         }
 
         let predictor = smart_turn_rs::SmartTurnPredictor::new(model)
@@ -266,12 +281,7 @@ fn resolve_smart_turn_model_path(model: PathBuf) -> Result<PathBuf> {
     }
 
     if model.is_dir() {
-        return model_locator::resolve_unique_file_in_dir(
-            &model,
-            "SMART_TURN_MODEL",
-            "onnx",
-            |name| name.contains("smart-turn") || name.contains("smart_turn"),
-        );
+        return resolve_smart_turn_model_in_dir(&model);
     }
 
     if !model.exists() {
@@ -281,4 +291,97 @@ fn resolve_smart_turn_model_path(model: PathBuf) -> Result<PathBuf> {
         "SMART_TURN_MODEL must point to a .onnx file (or a directory containing smart-turn*.onnx), got: {}",
         model.display()
     );
+}
+
+fn resolve_smart_turn_model_in_dir(dir: &Path) -> Result<PathBuf> {
+    let mut candidates = Vec::<PathBuf>::new();
+    for entry in std::fs::read_dir(dir)
+        .with_context(|| format!("failed to read SMART_TURN_MODEL directory: {}", dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() || !is_model_path(&path) {
+            continue;
+        }
+        let file_name = path
+            .file_name()
+            .and_then(|v| v.to_str())
+            .unwrap_or_default()
+            .to_lowercase();
+        if file_name.contains("smart-turn") || file_name.contains("smart_turn") {
+            candidates.push(path);
+        }
+    }
+
+    if candidates.is_empty() {
+        bail!(
+            "SMART_TURN_MODEL points to a directory but no smart-turn*.onnx file was found: {}",
+            dir.display()
+        );
+    }
+    if candidates.len() == 1 {
+        return Ok(candidates.swap_remove(0));
+    }
+
+    let prefer = env::string("SMART_TURN_VARIANT")
+        .unwrap_or_else(|| "gpu".to_string())
+        .to_lowercase();
+    let prefer = prefer.trim();
+    let pick = match prefer {
+        "gpu" => pick_smart_turn_variant(&candidates, "gpu"),
+        "cpu" => pick_smart_turn_variant(&candidates, "cpu"),
+        other => bail!("SMART_TURN_VARIANT must be `cpu` or `gpu`, got: {other}"),
+    };
+    if let Some(path) = pick {
+        return Ok(path);
+    }
+
+    candidates.sort();
+    let list = candidates
+        .iter()
+        .map(|p| format!("- {}", p.display()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    bail!(
+        "SMART_TURN_MODEL points to a directory with multiple candidates and none matched SMART_TURN_VARIANT={prefer}. Please set SMART_TURN_MODEL to an explicit file path.\n{list}"
+    );
+}
+
+fn pick_smart_turn_variant(candidates: &[PathBuf], needle: &str) -> Option<PathBuf> {
+    let mut matches = candidates
+        .iter()
+        .filter_map(|path| {
+            let file_name = path.file_name()?.to_str()?.to_lowercase();
+            if file_name.contains(needle) {
+                Some(path.clone())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    matches.sort();
+    matches.pop()
+}
+
+#[cfg(all(target_os = "windows", feature = "gpt-sovits"))]
+fn is_gpt_sovits_backend_selected() -> bool {
+    let Some(value) = env::string("TTS_BACKEND") else {
+        return false;
+    };
+    matches!(
+        value.trim().to_lowercase().as_str(),
+        "gpt-sovits" | "gpt_sovits" | "gsv"
+    )
+}
+
+#[cfg(all(target_os = "windows", feature = "gpt-sovits"))]
+fn is_smart_turn_cpu_model_path(model: &Path) -> bool {
+    let file_name = model
+        .file_name()
+        .and_then(|v| v.to_str())
+        .unwrap_or_default()
+        .to_lowercase();
+    (file_name.contains("smart-turn") || file_name.contains("smart_turn"))
+        && file_name.contains("cpu")
+        && !file_name.contains("gpu")
 }

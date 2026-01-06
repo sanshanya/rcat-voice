@@ -102,6 +102,8 @@ cargo run --example stream_sim --features gpt-sovits
 
 如果你在 Windows 上同时启用 `gpt-sovits`（libtorch）和 `turn-smart`/`asr-sherpa`（ONNX Runtime），遇到 `STATUS_HEAP_CORRUPTION` 或 OpenMP 运行时冲突，可尝试在启动前设置：`$env:KMP_DUPLICATE_LIB_OK="TRUE"`。
 
+> 经验结论：这类 `STATUS_HEAP_CORRUPTION (0xc0000374)` 属于原生层崩溃（非 Rust panic），`KMP_DUPLICATE_LIB_OK` 只能“可能缓解”，无法保证稳定；应用落地（例如 Tauri 宿主）建议优先用 `gpt-sovits-onnx`，如需 CUDA GPT-SoVITS 建议做进程隔离（worker/HTTP）。详见 `docs/TROUBLESHOOTING.md`。
+
 ## 快速开始（CPU ONNX GPT-SoVITS）
 
 1) 按 `gpt-sovits-onnx-rs` 的 `scripts/README.md` 转换模型，得到 ONNX 模型目录。

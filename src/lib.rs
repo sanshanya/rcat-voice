@@ -27,6 +27,8 @@ mod internal;
 
 pub mod prelude {
     pub use crate::audio::{AudioBackend, AudioBackendKind, AudioConfig, RodioConfig};
+    #[cfg(feature = "asr-mic")]
+    pub use crate::audio::{MicConfig, MicStream};
     pub use crate::asr::AsrSegment;
     #[cfg(feature = "asr-sherpa")]
     pub use crate::asr::{AsrModelDtype, SherpaAsrConfig, SherpaAsrModel, SherpaAsrStream, SherpaVadConfig};

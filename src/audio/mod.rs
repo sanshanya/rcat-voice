@@ -166,12 +166,12 @@ impl AudioConfig {
 pub fn build(config: &AudioConfig) -> Result<Arc<dyn AudioBackend>> {
     match &config.backend {
         AudioBackendKind::Rodio(cfg) => build_rodio_backend(cfg.clone()),
-        AudioBackendKind::Wasapi => {
-            Err(anyhow::anyhow!("AUDIO_BACKEND=wasapi is not implemented yet"))
-        }
-        AudioBackendKind::System => {
-            Err(anyhow::anyhow!("AUDIO_BACKEND=system is not implemented yet"))
-        }
+        AudioBackendKind::Wasapi => Err(anyhow::anyhow!(
+            "AUDIO_BACKEND=wasapi is not implemented yet"
+        )),
+        AudioBackendKind::System => Err(anyhow::anyhow!(
+            "AUDIO_BACKEND=system is not implemented yet"
+        )),
     }
 }
 
@@ -199,5 +199,10 @@ pub mod rodio;
 #[cfg(feature = "audio-rodio")]
 pub use rodio::RodioBackend;
 
-pub mod wasapi;
+#[cfg(feature = "asr-mic")]
+pub mod mic;
+#[cfg(feature = "asr-mic")]
+pub use mic::{MicConfig, MicHandle, MicStream};
+
 pub mod system;
+pub mod wasapi;
