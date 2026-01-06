@@ -8,10 +8,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{mpsc, watch};
 use tokio::time::{Duration, Instant, sleep};
 use tracing::info;
+use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt().with_env_filter("info").init();
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
 
     info!("Starting rcat-voice pipeline...");
 
@@ -44,11 +46,11 @@ async fn run_round(
     tts_engine: Arc<dyn TtsEngine>,
     cancelled: Arc<AtomicBool>,
 ) -> Result<bool> {
-    let task_start = Instant::now(); // t0：任务起点
+    let session_start_ts = Instant::now(); // t0 fallback：会话创建时间
     let llm_start = Arc::new(OnceLock::new());
 
     let (cancel_tx, cancel_rx) = watch::channel(false);
-    let (_pause_tx, pause_rx) = watch::channel(false);
+    let (_interrupt_tx, interrupt_rx) = watch::channel(0u64);
     let (delta_tx, delta_rx) = mpsc::channel::<String>(8192);
     let (chunk_tx, chunk_rx) = mpsc::channel::<Segment>(4096);
     let (buffer_tx, buffer_rx) = watch::channel(0u64);
@@ -108,7 +110,7 @@ async fn run_round(
     let pipeline = Pipeline::new(
         chunk_rx,
         cancel_rx.clone(),
-        pause_rx.clone(),
+        interrupt_rx.clone(),
         tts_engine.clone(),
         PipelineConfig::from_env(),
     );
@@ -119,9 +121,9 @@ async fn run_round(
         delta_rx,
         chunk_tx,
         cancel_rx.clone(),
-        pause_rx.clone(),
+        interrupt_rx.clone(),
         buffer_rx,
-        task_start,
+        session_start_ts,
         llm_start.clone(),
         TokenizerConfig::from_env(),
     );

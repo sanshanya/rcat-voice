@@ -4,6 +4,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::oneshot;
 use tokio::time::Instant;
 
+use crate::internal::env;
+
 /// 单个音频片段的播放时间信息。
 pub struct SegmentPlayback {
     /// 首个音频样本时间戳（流式时可用）。
@@ -106,26 +108,10 @@ impl Default for RodioConfig {
 
 impl RodioConfig {
     pub fn from_env() -> Self {
-        let sample_rate = std::env::var("AUDIO_SAMPLE_RATE")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(32_000)
-            .clamp(8_000, 96_000);
-        let channels = std::env::var("AUDIO_CHANNELS")
-            .ok()
-            .and_then(|v| v.parse::<u16>().ok())
-            .unwrap_or(1)
-            .clamp(1, 2);
-        let ring_seconds = std::env::var("AUDIO_RING_SECONDS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(60)
-            .clamp(1, 60);
-        let prefill_ms = std::env::var("AUDIO_PREFILL_MS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(50)
-            .min(2000);
+        let sample_rate = env::u32_clamped("AUDIO_SAMPLE_RATE", 32_000, 8_000, 96_000);
+        let channels = env::u16_clamped("AUDIO_CHANNELS", 1, 1, 2);
+        let ring_seconds = env::u64_clamped("AUDIO_RING_SECONDS", 60, 1, 60);
+        let prefill_ms = env::u64_clamped("AUDIO_PREFILL_MS", 50, 0, 2000);
         Self {
             sample_rate,
             channels,
@@ -161,8 +147,8 @@ impl Default for AudioConfig {
 
 impl AudioConfig {
     pub fn from_env() -> Result<Self> {
-        let backend = std::env::var("AUDIO_BACKEND").unwrap_or_else(|_| "rodio".to_string());
-        match backend.as_str() {
+        let backend = env::string("AUDIO_BACKEND").unwrap_or_else(|| "rodio".to_string());
+        match backend.trim().to_lowercase().as_str() {
             "rodio" => Ok(Self {
                 backend: AudioBackendKind::Rodio(RodioConfig::from_env()),
             }),
@@ -180,12 +166,12 @@ impl AudioConfig {
 pub fn build(config: &AudioConfig) -> Result<Arc<dyn AudioBackend>> {
     match &config.backend {
         AudioBackendKind::Rodio(cfg) => build_rodio_backend(cfg.clone()),
-        AudioBackendKind::Wasapi => {
-            Err(anyhow::anyhow!("AUDIO_BACKEND=wasapi is not implemented yet"))
-        }
-        AudioBackendKind::System => {
-            Err(anyhow::anyhow!("AUDIO_BACKEND=system is not implemented yet"))
-        }
+        AudioBackendKind::Wasapi => Err(anyhow::anyhow!(
+            "AUDIO_BACKEND=wasapi is not implemented yet"
+        )),
+        AudioBackendKind::System => Err(anyhow::anyhow!(
+            "AUDIO_BACKEND=system is not implemented yet"
+        )),
     }
 }
 
@@ -213,5 +199,10 @@ pub mod rodio;
 #[cfg(feature = "audio-rodio")]
 pub use rodio::RodioBackend;
 
-pub mod wasapi;
+#[cfg(feature = "asr-mic")]
+pub mod mic;
+#[cfg(feature = "asr-mic")]
+pub use mic::{MicConfig, MicHandle, MicStream};
+
 pub mod system;
+pub mod wasapi;

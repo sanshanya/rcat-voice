@@ -18,6 +18,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::{error, info};
+use tracing_subscriber::EnvFilter;
 
 struct RunningChat {
     session: StreamSession,
@@ -28,7 +29,8 @@ struct RunningChat {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt().with_env_filter("info").init();
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
 
     let base_url = Arc::new(
         std::env::var("OPENAI_BASE_URL")

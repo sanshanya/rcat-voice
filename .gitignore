@@ -1,4 +1,8 @@
 /target
+
+# GPT-SoVITS CUDA weights
 /v2pro/**/*.pt
+
+# GPT-SoVITS ONNX exports (keep small refs/configs, ignore large artifacts)
 /onnx/**/*.onnx
 /asrmodel

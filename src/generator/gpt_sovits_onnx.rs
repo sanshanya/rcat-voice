@@ -1,4 +1,4 @@
-use crate::audio::{AudioBackend, CancelToken};
+use crate::audio::{AudioBackend, CancelScope, CancelToken, SegmentPlayback};
 use super::{Result, SynthesizedAudio, TtsEngine, TtsMetrics};
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::time::Instant;
 use tracing::info;
+
+use crate::internal::{env, model_locator};
 
 const DEFAULT_MODEL_DIR: &str = "onnx";
 const DEFAULT_EXPORT_NAME: &str = "custom";
@@ -35,25 +37,17 @@ impl Default for GptSovitsOnnxSampling {
 impl GptSovitsOnnxSampling {
     pub fn from_env() -> Self {
         let mut cfg = Self::default();
-        if let Ok(value) = std::env::var("GSV_ONNX_TEMPERATURE") {
-            if let Ok(parsed) = value.parse::<f32>() {
-                cfg.temperature = parsed.max(0.0);
-            }
+        if let Some(parsed) = env::get::<f32>("GSV_ONNX_TEMPERATURE") {
+            cfg.temperature = parsed.max(0.0);
         }
-        if let Ok(value) = std::env::var("GSV_ONNX_TOP_K") {
-            if let Ok(parsed) = value.parse::<usize>() {
-                cfg.top_k = parsed;
-            }
+        if let Some(parsed) = env::get::<usize>("GSV_ONNX_TOP_K") {
+            cfg.top_k = parsed;
         }
-        if let Ok(value) = std::env::var("GSV_ONNX_TOP_P") {
-            if let Ok(parsed) = value.parse::<f32>() {
-                cfg.top_p = parsed;
-            }
+        if let Some(parsed) = env::get::<f32>("GSV_ONNX_TOP_P") {
+            cfg.top_p = parsed;
         }
-        if let Ok(value) = std::env::var("GSV_ONNX_REP_PENALTY") {
-            if let Ok(parsed) = value.parse::<f32>() {
-                cfg.repetition_penalty = parsed.max(0.1);
-            }
+        if let Some(parsed) = env::get::<f32>("GSV_ONNX_REP_PENALTY") {
+            cfg.repetition_penalty = parsed.max(0.1);
         }
         cfg
     }
@@ -93,30 +87,27 @@ impl GptSovitsOnnxConfig {
     }
 
     pub fn from_env() -> Result<Self> {
-        let model_dir = std::env::var("GSV_ONNX_MODEL_DIR")
-            .unwrap_or_else(|_| DEFAULT_MODEL_DIR.to_string());
-        let export_name = std::env::var("GSV_ONNX_EXPORT_NAME")
-            .unwrap_or_else(|_| DEFAULT_EXPORT_NAME.to_string());
+        let model_dir =
+            env::string("GSV_ONNX_MODEL_DIR").unwrap_or_else(|| DEFAULT_MODEL_DIR.to_string());
+        let export_name =
+            env::string("GSV_ONNX_EXPORT_NAME").unwrap_or_else(|| DEFAULT_EXPORT_NAME.to_string());
 
-        let bert_path = env_path("GSV_ONNX_BERT_PATH")?;
-        let g2pw_path = env_path("GSV_ONNX_G2PW_PATH")?;
-        let g2p_en_path = match env_path("GSV_ONNX_G2P_EN_PATH")? {
+        let bert_path = env::path_opt("GSV_ONNX_BERT_PATH")?;
+        let g2pw_path = env::path_opt("GSV_ONNX_G2PW_PATH")?;
+        let g2p_en_path = match env::path_opt("GSV_ONNX_G2P_EN_PATH")? {
             Some(path) => {
                 validate_g2p_en_dir(&path)?;
                 Some(path)
             }
             None => None,
         };
-        let sv_path = env_path("GSV_ONNX_SV_PATH")?;
-        let ref_wav_path = env_path("GSV_ONNX_REF_WAV")?;
-        let ref_text = std::env::var("GSV_ONNX_REF_TEXT").ok();
-        let lang = std::env::var("GSV_ONNX_LANG").unwrap_or_else(|_| "auto".to_string());
+        let sv_path = env::path_opt("GSV_ONNX_SV_PATH")?;
+        let ref_wav_path = env::path_opt("GSV_ONNX_REF_WAV")?;
+        let ref_text = env::string("GSV_ONNX_REF_TEXT");
+        let lang = env::string("GSV_ONNX_LANG").unwrap_or_else(|| "auto".to_string());
 
-        let chunk_samples = std::env::var("GSV_ONNX_CHUNK_SAMPLES")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(DEFAULT_CHUNK_SAMPLES)
-            .clamp(256, 16384);
+        let chunk_samples =
+            env::usize_clamped("GSV_ONNX_CHUNK_SAMPLES", DEFAULT_CHUNK_SAMPLES, 256, 16384);
 
         Ok(Self {
             model_dir: PathBuf::from(model_dir),
@@ -135,16 +126,12 @@ impl GptSovitsOnnxConfig {
 }
 
 pub struct GptSovitsOnnxTts {
-    inner: Arc<StdMutex<Inner>>,
-    cancel: CancelToken,
-    audio: Arc<dyn AudioBackend>,
-}
-
-struct Inner {
-    model: TTSModel,
+    model: Arc<StdMutex<TTSModel>>,
     sampling: SamplingParams,
     lang_id: LangId,
     chunk_samples: usize,
+    cancel: CancelToken,
+    audio: Arc<dyn AudioBackend>,
 }
 
 impl GptSovitsOnnxTts {
@@ -164,7 +151,7 @@ impl GptSovitsOnnxTts {
 
     pub fn from_config(config: GptSovitsOnnxConfig, audio: Arc<dyn AudioBackend>) -> Result<Self> {
         let base_dir = config.model_dir;
-        if !base_dir.exists() {
+        if !base_dir.is_dir() {
             return Err(anyhow!(
                 "GPT-SoVITS ONNX model dir not found: {}",
                 base_dir.display()
@@ -199,29 +186,40 @@ impl GptSovitsOnnxTts {
             "t2s_s_decoder.onnx".to_string(),
         ];
 
-        let sovits_path = first_existing(&base_dir, "SoVITS model", &sovits_candidates)?;
-        let ssl_path = first_existing(&base_dir, "SSL model", &ssl_candidates)?;
-        let t2s_encoder_path =
-            first_existing(&base_dir, "T2S encoder model", &t2s_encoder_candidates)?;
-        let t2s_fs_decoder_path =
-            first_existing(&base_dir, "T2S FS decoder model", &t2s_fs_decoder_candidates)?;
-        let t2s_s_decoder_path =
-            first_existing(&base_dir, "T2S S decoder model", &t2s_s_decoder_candidates)?;
+        let sovits_path =
+            model_locator::first_existing_file_rel(&base_dir, "SoVITS model", &sovits_candidates)?;
+        let ssl_path =
+            model_locator::first_existing_file_rel(&base_dir, "SSL model", &ssl_candidates)?;
+        let t2s_encoder_path = model_locator::first_existing_file_rel(
+            &base_dir,
+            "T2S encoder model",
+            &t2s_encoder_candidates,
+        )?;
+        let t2s_fs_decoder_path = model_locator::first_existing_file_rel(
+            &base_dir,
+            "T2S FS decoder model",
+            &t2s_fs_decoder_candidates,
+        )?;
+        let t2s_s_decoder_path = model_locator::first_existing_file_rel(
+            &base_dir,
+            "T2S S decoder model",
+            &t2s_s_decoder_candidates,
+        )?;
 
-        let bert_candidates = vec!["bert.onnx".to_string()];
-        let g2pw_candidates = vec!["g2pW.onnx".to_string(), "g2pw.onnx".to_string()];
-        let sv_candidates = vec!["sv.onnx".to_string()];
+        let bert_candidates = ["bert.onnx"];
+        let g2pw_candidates = ["g2pW.onnx", "g2pw.onnx"];
+        let sv_candidates = ["sv.onnx"];
 
         let bert_path = config
             .bert_path
-            .or_else(|| optional_existing(&base_dir, &bert_candidates));
+            .or_else(|| model_locator::optional_existing_file_rel(&base_dir, &bert_candidates));
         if bert_path.is_none() {
             info!("BERT model not found, using zero embeddings.");
         }
 
         let g2pw_path = config
             .g2pw_path
-            .or_else(|| optional_existing(&base_dir, &g2pw_candidates));
+            .or_else(|| model_locator::optional_existing_file_rel(&base_dir, &g2pw_candidates));
         if g2pw_path.is_none() {
             info!("G2PW model not found, using simple pinyin fallback.");
         }
@@ -239,7 +237,7 @@ impl GptSovitsOnnxTts {
 
         let sv_path = config
             .sv_path
-            .or_else(|| optional_existing(&base_dir, &sv_candidates));
+            .or_else(|| model_locator::optional_existing_file_rel(&base_dir, &sv_candidates));
         if sv_path.is_none() {
             info!("SV model not found, speaker embedding disabled.");
         }
@@ -252,7 +250,7 @@ impl GptSovitsOnnxTts {
                     "ref_16k.wav".to_string(),
                     "ref16k.wav".to_string(),
                 ];
-                first_existing(&base_dir, "Reference wav", &ref_candidates)?
+                model_locator::first_existing_file_rel(&base_dir, "Reference wav", &ref_candidates)?
             }
         };
 
@@ -310,41 +308,66 @@ impl GptSovitsOnnxTts {
         );
 
         Ok(Self {
-            inner: Arc::new(StdMutex::new(Inner {
-                model,
-                sampling,
-                lang_id,
-                chunk_samples,
-            })),
+            model: Arc::new(StdMutex::new(model)),
+            sampling,
+            lang_id,
+            chunk_samples,
             cancel: CancelToken::new(),
             audio,
         })
     }
 }
 
+fn play_chunks(
+    samples: &[f32],
+    chunk_samples: usize,
+    audio: &dyn AudioBackend,
+    cancel: &CancelScope,
+) -> (Option<Instant>, Instant, SegmentPlayback) {
+    let mut first_audio_ts: Option<Instant> = None;
+    let mut segment = audio.begin_segment();
+    for chunk in samples.chunks(chunk_samples) {
+        if cancel.is_cancelled() {
+            break;
+        }
+        let written = segment.push(chunk, cancel);
+        if written == 0 {
+            continue;
+        }
+        if first_audio_ts.is_none() {
+            first_audio_ts = segment.first_audio_ts();
+        }
+    }
+
+    let gen_done_ts = Instant::now();
+    let playback = segment.finish(cancel.is_cancelled());
+    let first_audio_ts = first_audio_ts.or(playback.first_audio_ts);
+    (first_audio_ts, gen_done_ts, playback)
+}
+
 #[async_trait]
 impl TtsEngine for GptSovitsOnnxTts {
     async fn speak(&self, text: &str) -> Result<TtsMetrics> {
         let text = text.to_owned();
-        let inner = self.inner.clone();
+        let model = self.model.clone();
+        let sampling = self.sampling;
+        let lang_id = self.lang_id;
+        let chunk_samples = self.chunk_samples;
         let cancel = self.cancel.clone();
         let audio = self.audio.clone();
 
         let metrics = tokio::task::spawn_blocking(move || {
             let start_ts = Instant::now();
-            let mut first_audio_ts: Option<Instant> = None;
-
             let cancel_scope = cancel.scope();
 
-            let mut inner_guard = inner
-                .lock()
-                .map_err(|_| anyhow!("gpt-sovits-onnx engine lock poisoned"))?;
-            let inner = &mut *inner_guard;
-
-            let (spec, samples) = inner
-                .model
-                .synthesize_sync(&text, inner.sampling, inner.lang_id)
-                .map_err(|e| anyhow!("gpt-sovits-onnx synthesize failed: {e}"))?;
+            let (spec, samples) = {
+                let mut model_guard = model
+                    .lock()
+                    .map_err(|_| anyhow!("gpt-sovits-onnx engine lock poisoned"))?;
+                model_guard
+                    .synthesize_sync(&text, sampling, lang_id)
+                    .map_err(|e| anyhow!("gpt-sovits-onnx synthesize failed: {e}"))?
+            };
             if spec.sample_rate != audio.sample_rate() || spec.channels != audio.channels() {
                 return Err(anyhow!(
                     "gpt-sovits-onnx output {}Hz/{}ch does not match audio backend {}Hz/{}ch",
@@ -356,25 +379,8 @@ impl TtsEngine for GptSovitsOnnxTts {
                 .into());
             }
 
-            let mut segment = audio.begin_segment();
-            for chunk in samples.chunks(inner.chunk_samples) {
-                if cancel_scope.is_cancelled() {
-                    break;
-                }
-                let written = segment.push(chunk, &cancel_scope);
-                if written == 0 {
-                    continue;
-                }
-                if first_audio_ts.is_none() {
-                    first_audio_ts = segment.first_audio_ts();
-                }
-            }
-
-            let gen_done_ts = Instant::now();
-            let playback = segment.finish(cancel_scope.is_cancelled());
-            if first_audio_ts.is_none() {
-                first_audio_ts = playback.first_audio_ts;
-            }
+            let (first_audio_ts, gen_done_ts, playback) =
+                play_chunks(&samples, chunk_samples, audio.as_ref(), &cancel_scope);
 
             Ok::<TtsMetrics, anyhow::Error>(TtsMetrics {
                 start_ts,
@@ -401,7 +407,9 @@ impl TtsEngine for GptSovitsOnnxTts {
 
     async fn synthesize(&self, text: &str) -> Result<Option<SynthesizedAudio>> {
         let text = text.to_owned();
-        let inner = self.inner.clone();
+        let model = self.model.clone();
+        let sampling = self.sampling;
+        let lang_id = self.lang_id;
         let cancel = self.cancel.clone();
         let audio_backend = self.audio.clone();
 
@@ -409,15 +417,14 @@ impl TtsEngine for GptSovitsOnnxTts {
             let start_ts = Instant::now();
             let cancel_scope = cancel.scope();
 
-            let mut inner_guard = inner
-                .lock()
-                .map_err(|_| anyhow!("gpt-sovits-onnx engine lock poisoned"))?;
-            let inner = &mut *inner_guard;
-
-            let (spec, samples) = inner
-                .model
-                .synthesize_sync(&text, inner.sampling, inner.lang_id)
-                .map_err(|e| anyhow!("gpt-sovits-onnx synthesize failed: {e}"))?;
+            let (spec, samples) = {
+                let mut model_guard = model
+                    .lock()
+                    .map_err(|_| anyhow!("gpt-sovits-onnx engine lock poisoned"))?;
+                model_guard
+                    .synthesize_sync(&text, sampling, lang_id)
+                    .map_err(|e| anyhow!("gpt-sovits-onnx synthesize failed: {e}"))?
+            };
             if spec.sample_rate != audio_backend.sample_rate()
                 || spec.channels != audio_backend.channels()
             {
@@ -436,48 +443,30 @@ impl TtsEngine for GptSovitsOnnxTts {
             }
 
             let gen_done_ts = Instant::now();
-            Ok::<SynthesizedAudio, anyhow::Error>(SynthesizedAudio {
+            Ok::<Option<SynthesizedAudio>, anyhow::Error>(Some(SynthesizedAudio {
                 samples,
                 start_ts,
                 gen_done_ts,
-            })
+            }))
         })
         .await??;
 
-        Ok(Some(audio))
+        Ok(audio)
     }
 
     async fn play_samples(&self, audio: SynthesizedAudio) -> Result<Option<TtsMetrics>> {
         let cancel = self.cancel.clone();
         let audio_backend = self.audio.clone();
-        let inner = self.inner.clone();
+        let chunk_samples = self.chunk_samples;
 
         let metrics = tokio::task::spawn_blocking(move || {
             let cancel_scope = cancel.scope();
-            let chunk_samples = inner
-                .lock()
-                .map_err(|_| anyhow!("gpt-sovits-onnx engine lock poisoned"))?
-                .chunk_samples;
-
-            let mut first_audio_ts: Option<Instant> = None;
-            let mut segment = audio_backend.begin_segment();
-            for chunk in audio.samples.chunks(chunk_samples) {
-                if cancel_scope.is_cancelled() {
-                    break;
-                }
-                let written = segment.push(chunk, &cancel_scope);
-                if written == 0 {
-                    continue;
-                }
-                if first_audio_ts.is_none() {
-                    first_audio_ts = segment.first_audio_ts();
-                }
-            }
-
-            let playback = segment.finish(cancel_scope.is_cancelled());
-            if first_audio_ts.is_none() {
-                first_audio_ts = playback.first_audio_ts;
-            }
+            let (first_audio_ts, _enqueue_done_ts, playback) = play_chunks(
+                &audio.samples,
+                chunk_samples,
+                audio_backend.as_ref(),
+                &cancel_scope,
+            );
 
             Ok::<TtsMetrics, anyhow::Error>(TtsMetrics {
                 start_ts: audio.start_ts,
@@ -500,45 +489,6 @@ impl TtsEngine for GptSovitsOnnxTts {
 pub fn build(audio: Arc<dyn AudioBackend>) -> Result<Arc<dyn TtsEngine>> {
     info!("Initializing GPT-SoVITS ONNX backend...");
     Ok(Arc::new(GptSovitsOnnxTts::from_env(audio)?))
-}
-
-fn first_existing(base_dir: &Path, label: &str, candidates: &[String]) -> Result<PathBuf> {
-    for rel in candidates {
-        let p = base_dir.join(rel);
-        if p.exists() {
-            return Ok(p);
-        }
-    }
-    let tried = candidates
-        .iter()
-        .map(|c| format!("`{}`", base_dir.join(c).display()))
-        .collect::<Vec<_>>()
-        .join(", ");
-    Err(anyhow!("{label} not found (tried: {tried})").into())
-}
-
-fn optional_existing(base_dir: &Path, candidates: &[String]) -> Option<PathBuf> {
-    for rel in candidates {
-        let p = base_dir.join(rel);
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    None
-}
-
-fn env_path(key: &str) -> Result<Option<PathBuf>> {
-    match std::env::var(key) {
-        Ok(value) => {
-            let path = PathBuf::from(value);
-            if path.exists() {
-                Ok(Some(path))
-            } else {
-                Err(anyhow!("{key} not found: {}", path.display()).into())
-            }
-        }
-        Err(_) => Ok(None),
-    }
 }
 
 fn detect_g2p_en_dir(base_dir: &Path) -> Option<PathBuf> {

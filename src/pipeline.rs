@@ -1,18 +1,22 @@
-use crate::generator::{SynthesizedAudio, TtsEngine, TtsMetrics};
+use crate::generator::{SynthesizedAudio, TtsEngine};
+use crate::internal::env;
+use crate::internal::metrics;
 use crate::tokenizer::Segment;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-use tokio::sync::{mpsc, watch};
-use tokio::task::JoinSet;
-use tokio::time::{Instant, sleep_until};
-use tracing::{info, warn};
+use std::time::Duration;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
+use tokio::task::{Id, JoinSet};
+use tracing::warn;
 
 /// Pipeline scheduling knobs.
 #[derive(Debug, Clone)]
 pub struct PipelineConfig {
     pub parallel_synth: bool,
     pub synth_inflight: usize,
+    pub backlog_limit: usize,
+    pub synth_timeout_ms: u64,
 }
 
 impl Default for PipelineConfig {
@@ -20,31 +24,34 @@ impl Default for PipelineConfig {
         Self {
             parallel_synth: true,
             synth_inflight: 1,
+            backlog_limit: 32,
+            synth_timeout_ms: 30_000,
         }
     }
 }
 
 impl PipelineConfig {
     pub fn from_env() -> Self {
-        let parallel_synth = std::env::var("TTS_PARALLEL_SYNTH")
-            .map(|v| v != "0")
-            .unwrap_or(true);
-        let synth_inflight = std::env::var("TTS_SYNTH_INFLIGHT")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(1)
-            .clamp(1, 8);
-        Self {
-            parallel_synth,
-            synth_inflight,
-        }
+        let mut cfg = Self::default();
+
+        cfg.parallel_synth = env::bool01("TTS_PARALLEL_SYNTH", cfg.parallel_synth);
+        cfg.synth_inflight =
+            env::usize_clamped("TTS_SYNTH_INFLIGHT", cfg.synth_inflight, 1, 8);
+        cfg.backlog_limit = env::usize_clamped("TTS_BACKLOG_LIMIT", cfg.backlog_limit, 1, 4096);
+        cfg.synth_timeout_ms = env::u64_clamped(
+            "TTS_SYNTH_TIMEOUT_MS",
+            cfg.synth_timeout_ms,
+            0,
+            10 * 60_000,
+        );
+        cfg
     }
 }
 
 pub struct Pipeline {
     chunk_rx: mpsc::Receiver<Segment>,
     cancel_rx: watch::Receiver<bool>,
-    pause_rx: watch::Receiver<bool>,
+    interrupt_rx: watch::Receiver<u64>,
     engine: Arc<dyn TtsEngine>,
     config: PipelineConfig,
 }
@@ -66,14 +73,14 @@ impl Pipeline {
     pub fn new(
         chunk_rx: mpsc::Receiver<Segment>,
         cancel_rx: watch::Receiver<bool>,
-        pause_rx: watch::Receiver<bool>,
+        interrupt_rx: watch::Receiver<u64>,
         engine: Arc<dyn TtsEngine>,
         config: PipelineConfig,
     ) -> Self {
         Self {
             chunk_rx,
             cancel_rx,
-            pause_rx,
+            interrupt_rx,
             engine,
             config,
         }
@@ -85,35 +92,31 @@ impl Pipeline {
             return;
         }
 
-        let mut first = true;
+        let mut intro_logged = false;
         let last_play_done_ts: Arc<StdMutex<Option<tokio::time::Instant>>> =
             Arc::new(StdMutex::new(None));
-        let mut second_gen_logged = false;
         let mut play_done_tasks: JoinSet<()> = JoinSet::new();
         let mut cancel_closed = false;
-        let mut pause_closed = false;
+        let mut interrupt_closed = false;
 
         loop {
             if *self.cancel_rx.borrow() {
                 break;
             }
             let maybe_segment = tokio::select! {
-                res = self.pause_rx.changed(), if !pause_closed => {
+                res = self.interrupt_rx.changed(), if !interrupt_closed => {
                     if res.is_err() {
-                        pause_closed = true;
+                        interrupt_closed = true;
                         None
                     } else {
-                    if *self.pause_rx.borrow() {
                         let _ = self.engine.stop().await;
                         while self.chunk_rx.try_recv().is_ok() {}
                         play_done_tasks.abort_all();
                         while play_done_tasks.try_join_next().is_some() {}
-                        first = true;
-                        second_gen_logged = false;
+                        intro_logged = false;
                         if let Ok(mut guard) = last_play_done_ts.lock() {
                             *guard = None;
                         }
-                    }
                     None
                     }
                 }
@@ -132,11 +135,16 @@ impl Pipeline {
                 continue;
             };
 
-            log_segment_intro(&segment, &mut first, &mut second_gen_logged);
+            metrics::log_segment_intro(&segment, &mut intro_logged);
 
             match self.engine.speak(&segment.text).await {
                 Ok(metrics) => {
-                    log_playback_metrics(&segment, metrics, &last_play_done_ts, &mut play_done_tasks);
+                    metrics::log_playback_metrics(
+                        &segment,
+                        metrics,
+                        &last_play_done_ts,
+                        &mut play_done_tasks,
+                    );
                 }
                 Err(e) => {
                     warn!("TTS engine failed: {}", e);
@@ -144,33 +152,31 @@ impl Pipeline {
             }
         }
 
-        while play_done_tasks.join_next().await.is_some() {}
-        let done_ts = last_play_done_ts
-            .lock()
-            .map(|guard| *guard)
-            .unwrap_or(None);
-        if let Some(done_ts) = done_ts {
-            let now = Instant::now();
-            if done_ts > now {
-                sleep_until(done_ts).await;
-            }
-        }
+        metrics::await_playback_drain(&mut play_done_tasks, &last_play_done_ts).await;
     }
 
     async fn run_parallel(&mut self) {
-        let mut first = true;
+        let mut intro_logged = false;
         let last_play_done_ts: Arc<StdMutex<Option<tokio::time::Instant>>> =
             Arc::new(StdMutex::new(None));
-        let mut second_gen_logged = false;
         let mut play_done_tasks: JoinSet<()> = JoinSet::new();
         let mut cancel_closed = false;
-        let mut pause_closed = false;
+        let mut interrupt_closed = false;
 
-        let (synth_tx, mut synth_rx) = mpsc::channel::<SynthOutcome>(128);
-        let max_inflight = self.config.synth_inflight;
+        let max_inflight = self.config.synth_inflight.max(1);
+        let backlog_limit = self.config.backlog_limit.max(1);
+        let synth_timeout = if self.config.synth_timeout_ms == 0 {
+            None
+        } else {
+            Some(Duration::from_millis(self.config.synth_timeout_ms))
+        };
+
+        let mut semaphore = Arc::new(Semaphore::new(max_inflight));
+        let mut synth_tasks: JoinSet<SynthOutcome> = JoinSet::new();
+        let mut synth_jobs: HashMap<Id, SynthJob> = HashMap::new();
+
         let mut seq: u64 = 0;
         let mut next_seq: u64 = 0;
-        let mut inflight: usize = 0;
         let mut input_closed = false;
         let mut epoch: u64 = 0;
         let mut pending: BTreeMap<u64, SynthOutcome> = BTreeMap::new();
@@ -181,28 +187,42 @@ impl Pipeline {
                 break;
             }
 
+            while let Some(job) = backlog.pop_front() {
+                if let Err(job) = try_spawn_synth(
+                    job,
+                    self.engine.clone(),
+                    semaphore.clone(),
+                    synth_timeout,
+                    &mut synth_tasks,
+                    &mut synth_jobs,
+                ) {
+                    backlog.push_front(job);
+                    break;
+                }
+            }
+
             tokio::select! {
-                res = self.pause_rx.changed(), if !pause_closed => {
+                res = self.interrupt_rx.changed(), if !interrupt_closed => {
                     if res.is_err() {
-                        pause_closed = true;
+                        interrupt_closed = true;
                         continue;
                     }
-                    if *self.pause_rx.borrow() {
-                        let _ = self.engine.stop().await;
-                        while self.chunk_rx.try_recv().is_ok() {}
-                        play_done_tasks.abort_all();
-                        while play_done_tasks.try_join_next().is_some() {}
-                        pending.clear();
-                        backlog.clear();
-                        inflight = 0;
-                        epoch = epoch.wrapping_add(1);
-                        seq = 0;
-                        next_seq = 0;
-                        first = true;
-                        second_gen_logged = false;
-                        if let Ok(mut guard) = last_play_done_ts.lock() {
-                            *guard = None;
-                        }
+                    let _ = self.engine.stop().await;
+                    while self.chunk_rx.try_recv().is_ok() {}
+                    play_done_tasks.abort_all();
+                    while play_done_tasks.try_join_next().is_some() {}
+                    pending.clear();
+                    backlog.clear();
+                    synth_tasks.abort_all();
+                    synth_tasks.detach_all();
+                    synth_jobs.clear();
+                    semaphore = Arc::new(Semaphore::new(max_inflight));
+                    epoch = epoch.wrapping_add(1);
+                    seq = 0;
+                    next_seq = 0;
+                    intro_logged = false;
+                    if let Ok(mut guard) = last_play_done_ts.lock() {
+                        *guard = None;
                     }
                 }
                 res = self.cancel_rx.changed(), if !cancel_closed => {
@@ -210,10 +230,10 @@ impl Pipeline {
                         cancel_closed = true;
                     }
                 }
-                maybe_segment = self.chunk_rx.recv() => {
+                maybe_segment = self.chunk_rx.recv(), if !input_closed && backlog.len() < backlog_limit => {
                     match maybe_segment {
                         Some(segment) => {
-                            log_segment_intro(&segment, &mut first, &mut second_gen_logged);
+                            metrics::log_segment_intro(&segment, &mut intro_logged);
                             let seq_id = seq;
                             seq = seq.wrapping_add(1);
                             let job = SynthJob {
@@ -221,22 +241,14 @@ impl Pipeline {
                                 epoch,
                                 segment,
                             };
-                            if inflight < max_inflight {
-                                inflight += 1;
-                                let engine = self.engine.clone();
-                                let synth_tx = synth_tx.clone();
-                                tokio::spawn(async move {
-                                    let result = engine.synthesize(&job.segment.text).await;
-                                    let _ = synth_tx
-                                        .send(SynthOutcome {
-                                            seq: job.seq,
-                                            epoch: job.epoch,
-                                            segment: job.segment,
-                                            result,
-                                        })
-                                        .await;
-                                });
-                            } else {
+                            if let Err(job) = try_spawn_synth(
+                                job,
+                                self.engine.clone(),
+                                semaphore.clone(),
+                                synth_timeout,
+                                &mut synth_tasks,
+                                &mut synth_jobs,
+                            ) {
                                 backlog.push_back(job);
                             }
                         }
@@ -245,31 +257,28 @@ impl Pipeline {
                         }
                     }
                 }
-                maybe_result = synth_rx.recv() => {
-                    if let Some(outcome) = maybe_result {
-                        if outcome.epoch == epoch {
-                            if inflight > 0 {
-                                inflight -= 1;
+                maybe_join = synth_tasks.join_next_with_id(), if !synth_tasks.is_empty() => {
+                    if let Some(joined) = maybe_join {
+                        match joined {
+                            Ok((id, outcome)) => {
+                                let _ = synth_jobs.remove(&id);
+                                if outcome.epoch == epoch {
+                                    pending.insert(outcome.seq, outcome);
+                                }
                             }
-                            pending.insert(outcome.seq, outcome);
-                            while inflight < max_inflight {
-                                let Some(job) = backlog.pop_front() else {
-                                    break;
+                            Err(err) => {
+                                let id = err.id();
+                                let Some(job) = synth_jobs.remove(&id) else {
+                                    continue;
                                 };
-                                inflight += 1;
-                                let engine = self.engine.clone();
-                                let synth_tx = synth_tx.clone();
-                                tokio::spawn(async move {
-                                    let result = engine.synthesize(&job.segment.text).await;
-                                    let _ = synth_tx
-                                        .send(SynthOutcome {
-                                            seq: job.seq,
-                                            epoch: job.epoch,
-                                            segment: job.segment,
-                                            result,
-                                        })
-                                        .await;
-                                });
+                                if job.epoch == epoch {
+                                    pending.insert(job.seq, SynthOutcome {
+                                        seq: job.seq,
+                                        epoch: job.epoch,
+                                        segment: job.segment,
+                                        result: Err(anyhow::anyhow!("synth task failed: {err}")),
+                                    });
+                                }
                             }
                         }
                     }
@@ -284,7 +293,7 @@ impl Pipeline {
                 match outcome.result {
                     Ok(Some(audio)) => match self.engine.play_samples(audio).await {
                         Ok(Some(metrics)) => {
-                            log_playback_metrics(
+                            metrics::log_playback_metrics(
                                 &outcome.segment,
                                 metrics,
                                 &last_play_done_ts,
@@ -307,118 +316,60 @@ impl Pipeline {
                 }
             }
 
-            if input_closed && inflight == 0 && pending.is_empty() {
+            if input_closed && backlog.is_empty() && synth_tasks.is_empty() && pending.is_empty() {
                 break;
             }
         }
 
-        while play_done_tasks.join_next().await.is_some() {}
-        let done_ts = last_play_done_ts
-            .lock()
-            .map(|guard| *guard)
-            .unwrap_or(None);
-        if let Some(done_ts) = done_ts {
-            let now = Instant::now();
-            if done_ts > now {
-                sleep_until(done_ts).await;
-            }
-        }
+        synth_tasks.abort_all();
+        synth_tasks.detach_all();
+        metrics::await_playback_drain(&mut play_done_tasks, &last_play_done_ts).await;
     }
 }
 
-fn log_segment_intro(segment: &Segment, first: &mut bool, second_gen_logged: &mut bool) {
-    let chunk_chars = segment.text.chars().count();
-    if *first {
-        info!("=== 指标时间线 ===");
-
-        if let Some(t1) = segment.first_token_ts {
-            // LLM首字时延: 从请求到第一个字
-            let llm_delay = t1.duration_since(segment.task_start);
-            let llm_abs = llm_delay;
-            info!("LLM首字时延: {:?} @ {:?}", llm_delay, llm_abs);
-
-            // 分段器延迟: 从第一个字到第一段被分出来
-            let chunker_delay = segment.segment_sent_ts.duration_since(t1);
-            let chunker_abs = segment.segment_sent_ts.duration_since(segment.task_start);
-            info!("分段器延迟: {:?} @ {:?}", chunker_delay, chunker_abs);
-        }
-
-        if let Some(t_last) = segment.last_token_ts {
-            // 分段器末字延迟: 从最后一个字到分段送出
-            let tail_delay = segment.segment_sent_ts.duration_since(t_last);
-            let tail_abs = segment.segment_sent_ts.duration_since(segment.task_start);
-            info!("分段器末字延迟: {:?} @ {:?}", tail_delay, tail_abs);
-        }
-
-        info!("首段长度: {} 字符", chunk_chars);
-
-        *first = false;
-    }
-
-    if segment.first_token_ts.is_none() && !*second_gen_logged {
-        let now = Instant::now();
-        let gen_abs = now.duration_since(segment.task_start);
-        let gen_delay = now.duration_since(segment.segment_sent_ts);
-        info!("二句生成开始: {:?} @ {:?}", gen_delay, gen_abs);
-        *second_gen_logged = true;
-    }
+fn try_spawn_synth(
+    job: SynthJob,
+    engine: Arc<dyn TtsEngine>,
+    semaphore: Arc<Semaphore>,
+    synth_timeout: Option<Duration>,
+    tasks: &mut JoinSet<SynthOutcome>,
+    task_index: &mut HashMap<Id, SynthJob>,
+) -> std::result::Result<(), SynthJob> {
+    let Ok(permit) = semaphore.clone().try_acquire_owned() else {
+        return Err(job);
+    };
+    spawn_synth_with_permit(job, permit, engine, synth_timeout, tasks, task_index);
+    Ok(())
 }
 
-fn log_playback_metrics(
-    segment: &Segment,
-    metrics: TtsMetrics,
-    last_play_done_ts: &Arc<StdMutex<Option<tokio::time::Instant>>>,
-    play_done_tasks: &mut JoinSet<()>,
+fn spawn_synth_with_permit(
+    job: SynthJob,
+    permit: OwnedSemaphorePermit,
+    engine: Arc<dyn TtsEngine>,
+    synth_timeout: Option<Duration>,
+    tasks: &mut JoinSet<SynthOutcome>,
+    task_index: &mut HashMap<Id, SynthJob>,
 ) {
-    let TtsMetrics {
-        start_ts,
-        first_audio_ts,
-        gen_done_ts,
-        play_done_ts: _,
-        play_done_rx,
-    } = metrics;
-    let chunk_chars = segment.text.chars().count();
-    let first_audio_ts = first_audio_ts.unwrap_or(start_ts);
-    let first_audio_abs = first_audio_ts.duration_since(segment.task_start);
-    let gen_done_abs = gen_done_ts.duration_since(segment.task_start);
-    let is_first_chunk = segment.first_token_ts.is_some();
-
-    // OS TTS 是同步的：合成+播放一体，这里是播放完成的时间
-    if is_first_chunk {
-        let first_audio_delay = first_audio_ts.duration_since(segment.segment_sent_ts);
-        let gen_delay = gen_done_ts.duration_since(segment.segment_sent_ts);
-        info!("首播时延: {:?} @ {:?}", first_audio_delay, first_audio_abs);
-        info!("首句生成时延: {:?} @ {:?}", gen_delay, gen_done_abs);
-    }
-
-    if let Some(play_done_rx) = play_done_rx {
-        let segment_sent_ts = segment.segment_sent_ts;
-        let task_start = segment.task_start;
-        let last_done = last_play_done_ts.clone();
-        play_done_tasks.spawn(async move {
-            if let Ok(ts) = play_done_rx.await {
-                let play_done_abs = ts.saturating_duration_since(task_start);
-                let play_delay = ts.saturating_duration_since(segment_sent_ts);
-                if is_first_chunk {
-                    info!(
-                        "首句播放完成(真实): {:?} @ {:?} | {} 字符",
-                        play_delay,
-                        play_done_abs,
-                        chunk_chars
-                    );
-                } else {
-                    info!(
-                        "音频块播放完成(真实): {:?} @ {:?} | {} 字符",
-                        play_delay,
-                        play_done_abs,
-                        chunk_chars
-                    );
-                }
-                let mut guard = last_done.lock().expect("playback done lock poisoned");
-                if guard.map_or(true, |prev| ts > prev) {
-                    *guard = Some(ts);
-                }
-            }
-        });
-    }
+    let job_for_map = SynthJob {
+        seq: job.seq,
+        epoch: job.epoch,
+        segment: job.segment.clone(),
+    };
+    let abort = tasks.spawn(async move {
+        let _permit = permit;
+        let result = match synth_timeout {
+            Some(timeout) => match tokio::time::timeout(timeout, engine.synthesize(&job.segment.text)).await {
+                Ok(res) => res,
+                Err(_) => Err(anyhow::anyhow!("synthesize timed out after {}ms", timeout.as_millis())),
+            },
+            None => engine.synthesize(&job.segment.text).await,
+        };
+        SynthOutcome {
+            seq: job.seq,
+            epoch: job.epoch,
+            segment: job.segment,
+            result,
+        }
+    });
+    task_index.insert(abort.id(), job_for_map);
 }
