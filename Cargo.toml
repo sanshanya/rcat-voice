@@ -5,12 +5,20 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util", "signal", "io-std"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util", "signal", "io-std", "net"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "tracing-log"] }
 async-trait = "0.1"
 crossbeam-queue = "0.3"
 rand_core = { version = "=0.10.0-rc-2", default-features = false }
+bytes = { version = "1", optional = true }
+futures-util = { version = "0.3", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls-native-roots"], optional = true }
+hyper = { version = "1", features = ["server", "http1"], optional = true }
+hyper-util = { version = "0.1", features = ["tokio"], optional = true }
+http-body-util = { version = "0.1", optional = true }
 cpal = { version = "0.15.3", optional = true }
 smart-turn-rs = { package = "smart-turn-rs", git = "https://github.com/miuda-ai/smart-turn-rs", rev = "92c3fca4d9ef690d142ccaf5193e6469b3517979", optional = true }
 
@@ -35,6 +43,8 @@ tokenizer-jieba = ["dep:jieba-rs"]
 asr-sherpa = ["dep:sherpa-rs"]
 asr-mic = ["dep:cpal"]
 turn-smart = ["dep:smart-turn-rs"]
+tts-remote = ["dep:bytes", "dep:futures-util", "dep:reqwest", "dep:serde", "dep:serde_json", "audio-rodio"]
+tts-worker = ["dep:bytes", "dep:futures-util", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:serde", "dep:serde_json", "gpt-sovits"]
 
 [dev-dependencies]
 async-openai = { version = "0.32.2", features = ["byot", "chat-completion", "native-tls"] }

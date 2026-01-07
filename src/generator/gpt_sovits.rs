@@ -1,7 +1,9 @@
-use crate::audio::{AudioBackend, CancelScope, CancelToken, SegmentWriter};
+use crate::audio::{AudioBackend, AudioStreamSegment, CancelScope, CancelToken};
 use super::{Result, SynthesizedAudio, TtsEngine, TtsMetrics};
 use anyhow::anyhow;
 use async_trait::async_trait;
+#[cfg(feature = "tts-worker")]
+use bytes::Bytes;
 use gpt_sovits_rs::gsv;
 use gpt_sovits_rs::tch;
 use gpt_sovits_rs::text::G2PConfig;
@@ -10,6 +12,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "tts-worker")]
+use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tracing::{info, warn};
 
@@ -346,7 +350,9 @@ impl GptSovitsConfig {
             info!("Max cut token: {}", self.max_cut_token);
         }
 
-        self.log_text_metrics = env::bool01("GSV_TEXT_METRICS", false);
+        let voice_metrics =
+            env::bool01("VOICE_TTS_METRICS", false) || env::bool01("TTS_WORKER_METRICS", false);
+        self.log_text_metrics = env::bool01("GSV_TEXT_METRICS", false) || voice_metrics;
         self.jieba_bench = env::bool01("GSV_JIEBA_BENCH", false);
         if self.jieba_bench {
             info!("Jieba bench enabled (extra cut per chunk).");
@@ -394,30 +400,9 @@ trait ChunkSink {
     fn on_chunk(&mut self, samples: &[f32], cancel: &CancelScope) -> Result<bool>;
 }
 
-struct PlaybackSink<'a> {
-    segment: &'a mut dyn SegmentWriter,
-    first_audio_ts: Option<Instant>,
-}
-
-impl<'a> PlaybackSink<'a> {
-    fn new(segment: &'a mut dyn SegmentWriter) -> Self {
-        Self {
-            segment,
-            first_audio_ts: None,
-        }
-    }
-}
-
-impl ChunkSink for PlaybackSink<'_> {
+impl ChunkSink for AudioStreamSegment {
     fn on_chunk(&mut self, samples: &[f32], cancel: &CancelScope) -> Result<bool> {
-        let written = self.segment.push(samples, cancel);
-        if written == 0 {
-            return Ok(false);
-        }
-        if self.first_audio_ts.is_none() {
-            self.first_audio_ts = self.segment.first_audio_ts();
-        }
-        Ok(true)
+        Ok(self.push(samples, cancel))
     }
 }
 
@@ -525,16 +510,149 @@ fn run_stream_infer(
         audio_cpu.f_copy_data(&mut samples_buf, audio_size)?;
 
         let accepted = sink.on_chunk(&samples_buf, cancel_scope)?;
-        if accepted {
-            if let Some(start) = io_start {
-                let elapsed = start.elapsed();
-                info!("first chunk cpu+append time: {:?}", elapsed);
-                first_chunk_io_logged = true;
-            }
+        if !accepted {
+            break;
+        }
+        if let Some(start) = io_start {
+            let elapsed = start.elapsed();
+            info!("first chunk cpu+append time: {:?}", elapsed);
+            first_chunk_io_logged = true;
         }
     }
 
     Ok(())
+}
+
+#[cfg(feature = "tts-worker")]
+#[derive(Debug, Default, Clone)]
+pub(crate) struct Pcm16StreamStats {
+    pub first_audio_ts: Option<Instant>,
+    pub chunks: u64,
+    pub samples: u64,
+    pub bytes: u64,
+}
+
+#[cfg(feature = "tts-worker")]
+pub(crate) struct Pcm16StreamOutcome {
+    pub stats: Pcm16StreamStats,
+    pub result: Result<()>,
+}
+
+#[cfg(feature = "tts-worker")]
+struct Pcm16MpscSink {
+    tx: mpsc::Sender<Bytes>,
+    cancel: CancelToken,
+    stats: Pcm16StreamStats,
+    log_metrics: bool,
+}
+
+#[cfg(feature = "tts-worker")]
+impl Pcm16MpscSink {
+    fn new(tx: mpsc::Sender<Bytes>, cancel: CancelToken, log_metrics: bool) -> Self {
+        Self {
+            tx,
+            cancel,
+            stats: Pcm16StreamStats::default(),
+            log_metrics,
+        }
+    }
+}
+
+#[cfg(feature = "tts-worker")]
+impl ChunkSink for Pcm16MpscSink {
+    fn on_chunk(&mut self, samples: &[f32], cancel: &CancelScope) -> Result<bool> {
+        if cancel.is_cancelled() {
+            return Ok(false);
+        }
+
+        if samples.is_empty() {
+            return Ok(true);
+        }
+
+        let mut pcm = Vec::<u8>::with_capacity(samples.len().saturating_mul(2));
+        for &s in samples {
+            let scaled = (s * 32768.0)
+                .round()
+                .clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+            pcm.extend_from_slice(&scaled.to_le_bytes());
+        }
+
+        let bytes_len = pcm.len() as u64;
+        let samples_len = samples.len() as u64;
+
+        match self.tx.blocking_send(Bytes::from(pcm)) {
+            Ok(_) => {
+                if self.log_metrics {
+                    self.stats.chunks += 1;
+                    self.stats.samples += samples_len;
+                    self.stats.bytes += bytes_len;
+                    if self.stats.first_audio_ts.is_none() {
+                        self.stats.first_audio_ts = Some(Instant::now());
+                    }
+                }
+                Ok(true)
+            }
+            Err(_) => {
+                self.cancel.cancel();
+                Ok(false)
+            }
+        }
+    }
+}
+
+#[cfg(feature = "tts-worker")]
+pub(crate) struct GptSovitsWorkerModel {
+    inner: StdMutex<Inner>,
+    first_call: AtomicBool,
+}
+
+#[cfg(feature = "tts-worker")]
+impl GptSovitsWorkerModel {
+    pub(crate) fn from_env_cuda_only() -> Result<Self> {
+        let config = GptSovitsConfig::from_env()?;
+        let device = tch::Device::cuda_if_available();
+        if !matches!(device, tch::Device::Cuda(_)) {
+            return Err(anyhow!(
+                "CUDA device is required for gpt-sovits worker; ensure CUDA libtorch is loaded"
+            )
+            .into());
+        }
+        let inner = build_inner(&config, device)?;
+        Ok(Self {
+            inner: StdMutex::new(inner),
+            first_call: AtomicBool::new(true),
+        })
+    }
+
+    pub(crate) fn stream_pcm16le(
+        &self,
+        text: &str,
+        tx: mpsc::Sender<Bytes>,
+        log_metrics: bool,
+    ) -> Pcm16StreamOutcome {
+        let cancel = CancelToken::new();
+        let cancel_scope = cancel.scope();
+        let is_first = self.first_call.swap(false, Ordering::AcqRel);
+
+        let mut sink = Pcm16MpscSink::new(tx, cancel, log_metrics);
+        let inner_guard = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow!("gpt-sovits worker lock poisoned"));
+        let result = match inner_guard {
+            Ok(guard) => {
+                let inner = &*guard;
+                let _g = tch::no_grad_guard();
+                run_stream_infer(inner, text, is_first, &cancel_scope, &mut sink)
+            }
+            Err(err) => Err(err.into()),
+        };
+
+        Pcm16StreamOutcome {
+            stats: sink.stats,
+            result,
+        }
+    }
 }
 
 #[async_trait]
@@ -557,16 +675,10 @@ impl TtsEngine for GptSovitsTts {
             let inner = &*inner_guard;
 
             let _g = tch::no_grad_guard();
-            let mut segment = audio.begin_segment();
-
-            let first_audio_ts = {
-                let mut sink = PlaybackSink::new(segment.as_mut());
-                run_stream_infer(inner, &text, is_first, &cancel_scope, &mut sink)?;
-                sink.first_audio_ts
-            };
+            let mut segment = AudioStreamSegment::new(audio.as_ref());
+            run_stream_infer(inner, &text, is_first, &cancel_scope, &mut segment)?;
             let gen_done_ts = Instant::now();
-            let playback = segment.finish(cancel_scope.is_cancelled());
-            let first_audio_ts = first_audio_ts.or(playback.first_audio_ts);
+            let (first_audio_ts, playback) = segment.finish(cancel_scope.is_cancelled());
             let play_done_ts = playback.play_done_ts;
             let play_done_rx = playback.play_done_rx;
 
@@ -633,26 +745,15 @@ impl TtsEngine for GptSovitsTts {
 
         let metrics = tokio::task::spawn_blocking(move || {
             let cancel_scope = cancel.scope();
-            let mut first_audio_ts: Option<Instant> = None;
-            let mut segment = audio_backend.begin_segment();
 
+            let mut segment = AudioStreamSegment::new(audio_backend.as_ref());
             for chunk in audio.samples.chunks(DEFAULT_PLAY_CHUNK_SAMPLES) {
-                if cancel_scope.is_cancelled() {
+                if !segment.push(chunk, &cancel_scope) {
                     break;
                 }
-                let written = segment.push(chunk, &cancel_scope);
-                if written == 0 {
-                    continue;
-                }
-                if first_audio_ts.is_none() {
-                    first_audio_ts = segment.first_audio_ts();
-                }
             }
 
-            let playback = segment.finish(cancel_scope.is_cancelled());
-            if first_audio_ts.is_none() {
-                first_audio_ts = playback.first_audio_ts;
-            }
+            let (first_audio_ts, playback) = segment.finish(cancel_scope.is_cancelled());
 
             Ok::<TtsMetrics, anyhow::Error>(TtsMetrics {
                 start_ts: audio.start_ts,

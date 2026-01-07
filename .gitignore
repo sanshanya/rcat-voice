@@ -5,4 +5,12 @@
 
 # GPT-SoVITS ONNX exports (keep small refs/configs, ignore large artifacts)
 /onnx/**/*.onnx
-/asrmodel
+/onnx/**/*.safetensors
+/onnx/**/.cache/
+/onnx/**/.cache/**
+/onnx/g2p_en/
+
+# ASR models (downloaded)
+/models/
+/asrmodel/
+v2pro/tokenizer.json

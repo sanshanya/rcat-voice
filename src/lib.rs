@@ -23,6 +23,10 @@ pub mod pipeline;
 pub mod streaming;
 pub mod tokenizer;
 pub mod turn;
+#[cfg(any(feature = "tts-remote", feature = "tts-worker"))]
+pub mod remote_tts_protocol;
+#[cfg(feature = "tts-worker")]
+pub mod worker;
 mod internal;
 
 pub mod prelude {
