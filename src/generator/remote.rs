@@ -45,11 +45,32 @@ impl RemoteTts {
             ))
         }
     }
+
+    pub fn with_audio(audio: std::sync::Arc<dyn crate::audio::AudioBackend>) -> Result<Self> {
+        #[cfg(feature = "tts-remote")]
+        {
+            Ok(Self {
+                inner: RemoteTtsInner::from_env_with_audio(audio)?,
+            })
+        }
+        #[cfg(not(feature = "tts-remote"))]
+        {
+            let _ = audio;
+            Err(anyhow!(
+                "TTS_BACKEND=remote requires the `tts-remote` feature (enable `--features tts-remote`)"
+            ))
+        }
+    }
 }
 
 #[cfg(feature = "tts-remote")]
 impl RemoteTtsInner {
     fn from_env() -> Result<Self> {
+        let audio = crate::audio::build_from_env()?;
+        Self::from_env_with_audio(audio)
+    }
+
+    fn from_env_with_audio(audio: Arc<dyn AudioBackend>) -> Result<Self> {
         let base_url = env::string("TTS_REMOTE_BASE_URL")
             .or_else(|| env::string("TTS_REMOTE_URL"))
             .unwrap_or_else(|| "http://127.0.0.1:7878".to_string());
@@ -71,8 +92,6 @@ impl RemoteTtsInner {
         let voice = env::string("TTS_REMOTE_VOICE")
             .or_else(|| env::string("TTS_VOICE"))
             .unwrap_or_else(|| "default".to_string());
-
-        let audio = crate::audio::build_from_env()?;
 
         let client = reqwest::Client::builder().build()?;
 

@@ -1,7 +1,7 @@
 use anyhow::{Result, bail};
 use async_trait::async_trait;
 use std::sync::Arc;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 use tokio::time::Instant;
 
 use crate::audio::AudioBackend;
@@ -140,6 +140,56 @@ pub fn build_from_env() -> Result<Arc<dyn TtsEngine>> {
         "gpt-sovits-onnx" => build_gpt_sovits_onnx_from_env(),
         "remote" => {
             Ok(Arc::new(RemoteTts::new()?))
+        }
+        _ => bail!("Unknown TTS_BACKEND: {backend}"),
+    }
+}
+
+pub fn build_from_env_with_rms_sender(
+    rms_tx: watch::Sender<crate::audio::RmsPayload>,
+) -> Result<Arc<dyn TtsEngine>> {
+    let backend_raw = env::string("TTS_BACKEND").unwrap_or_else(|| default_backend().to_string());
+    let backend = backend_raw
+        .trim()
+        .rsplit_once('=')
+        .map(|(_, v)| v)
+        .unwrap_or(backend_raw.trim())
+        .to_lowercase();
+
+    match backend.as_str() {
+        "os" => Ok(Arc::new(OsTts::new())),
+        "gpt-sovits" => {
+            #[cfg(all(feature = "gpt-sovits", target_os = "windows"))]
+            {
+                let audio = crate::audio::build_from_env()?;
+                let audio = crate::audio::with_rms_sender(audio, rms_tx);
+                gpt_sovits::build(audio)
+            }
+            #[cfg(not(all(feature = "gpt-sovits", target_os = "windows")))]
+            {
+                Err(anyhow::anyhow!(
+                    "TTS_BACKEND=gpt-sovits requires Windows and the `gpt-sovits` feature (use `--features gpt-sovits` or `--all-features`)"
+                ))
+            }
+        }
+        "gpt-sovits-onnx" => {
+            #[cfg(feature = "gpt-sovits-onnx")]
+            {
+                let audio = crate::audio::build_from_env()?;
+                let audio = crate::audio::with_rms_sender(audio, rms_tx);
+                gpt_sovits_onnx::build(audio)
+            }
+            #[cfg(not(feature = "gpt-sovits-onnx"))]
+            {
+                Err(anyhow::anyhow!(
+                    "TTS_BACKEND=gpt-sovits-onnx requires the `gpt-sovits-onnx` feature (use `--features gpt-sovits-onnx` or `--all-features`)"
+                ))
+            }
+        }
+        "remote" => {
+            let audio = crate::audio::build_from_env()?;
+            let audio = crate::audio::with_rms_sender(audio, rms_tx);
+            Ok(Arc::new(RemoteTts::with_audio(audio)?))
         }
         _ => bail!("Unknown TTS_BACKEND: {backend}"),
     }

@@ -1,7 +1,7 @@
 use anyhow::{Result, bail};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 use tokio::time::Instant;
 
 use crate::internal::env;
@@ -14,6 +14,15 @@ pub struct SegmentPlayback {
     pub play_done_ts: Instant,
     /// 实际播放完成时间戳的可选回传通道。
     pub play_done_rx: Option<oneshot::Receiver<Instant>>,
+}
+
+/// RMS/peak telemetry payload for lipsync or UI visualization.
+#[derive(Debug, Clone)]
+pub struct RmsPayload {
+    pub rms: f32,
+    pub peak: f32,
+    pub buffered_ms: u64,
+    pub speaking: bool,
 }
 
 /// Cancellation token for audio synthesis/playback.
@@ -62,6 +71,139 @@ pub trait SegmentWriter: Send {
     fn finish(self: Box<Self>, cancelled: bool) -> SegmentPlayback;
     /// 首个音频样本时间戳（若可用）。
     fn first_audio_ts(&self) -> Option<Instant>;
+}
+
+const RMS_SPEAKING_EPSILON: f32 = 1.0e-4;
+
+struct RmsAudioBackend {
+    inner: Arc<dyn AudioBackend>,
+    rms_tx: watch::Sender<RmsPayload>,
+}
+
+struct RmsSegmentWriter {
+    inner: Box<dyn SegmentWriter>,
+    audio: Arc<dyn AudioBackend>,
+    rms_tx: watch::Sender<RmsPayload>,
+}
+
+impl RmsSegmentWriter {
+    fn emit(&self, samples: &[f32], speaking: bool) {
+        if samples.is_empty() {
+            return;
+        }
+        let (rms, peak) = rms_and_peak(samples);
+        let buffered_ms_after = self.audio.buffered_ms().unwrap_or(0);
+        let denom = self.audio.sample_rate() as u64 * self.audio.channels() as u64;
+        let chunk_ms = if denom == 0 {
+            0
+        } else {
+            (samples.len() as u64).saturating_mul(1000) / denom
+        };
+        // `buffered_ms()` is sampled after writing the chunk, so it includes this chunk.
+        // Subtract the chunk duration to approximate "time until this chunk starts playing".
+        let buffered_ms = buffered_ms_after.saturating_sub(chunk_ms);
+        let _ = self.rms_tx.send(RmsPayload {
+            rms,
+            peak,
+            buffered_ms,
+            speaking,
+        });
+    }
+}
+
+impl SegmentWriter for RmsSegmentWriter {
+    fn push(&mut self, samples: &[f32], cancel: &CancelScope) -> usize {
+        let written = self.inner.push(samples, cancel);
+        if written == 0 {
+            return 0;
+        }
+        let slice = &samples[..written.min(samples.len())];
+        self.emit(slice, true);
+        written
+    }
+
+    fn finish(self: Box<Self>, cancelled: bool) -> SegmentPlayback {
+        let RmsSegmentWriter {
+            inner,
+            audio,
+            rms_tx,
+        } = *self;
+        let playback = inner.finish(cancelled);
+        let buffered_ms = audio.buffered_ms().unwrap_or(0);
+        let _ = rms_tx.send(RmsPayload {
+            rms: 0.0,
+            peak: 0.0,
+            buffered_ms,
+            speaking: false,
+        });
+        playback
+    }
+
+    fn first_audio_ts(&self) -> Option<Instant> {
+        self.inner.first_audio_ts()
+    }
+}
+
+impl AudioBackend for RmsAudioBackend {
+    fn begin_segment(&self) -> Box<dyn SegmentWriter> {
+        Box::new(RmsSegmentWriter {
+            inner: self.inner.begin_segment(),
+            audio: Arc::clone(&self.inner),
+            rms_tx: self.rms_tx.clone(),
+        })
+    }
+
+    fn stop(&self) {
+        self.inner.stop();
+        let buffered_ms = self.inner.buffered_ms().unwrap_or(0);
+        let _ = self.rms_tx.send(RmsPayload {
+            rms: 0.0,
+            peak: 0.0,
+            buffered_ms,
+            speaking: false,
+        });
+    }
+
+    fn sample_rate(&self) -> u32 {
+        self.inner.sample_rate()
+    }
+
+    fn channels(&self) -> u16 {
+        self.inner.channels()
+    }
+
+    fn buffered_ms(&self) -> Option<u64> {
+        self.inner.buffered_ms()
+    }
+}
+
+fn rms_and_peak(samples: &[f32]) -> (f32, f32) {
+    if samples.is_empty() {
+        return (0.0, 0.0);
+    }
+    let mut sum = 0.0f32;
+    let mut peak = 0.0f32;
+    for &s in samples {
+        let v = s.abs();
+        peak = peak.max(v);
+        sum += v * v;
+    }
+    let rms = (sum / samples.len() as f32).sqrt();
+    let rms = if rms.is_finite() { rms } else { 0.0 };
+    let peak = if peak.is_finite() { peak } else { 0.0 };
+    if rms > RMS_SPEAKING_EPSILON || peak > RMS_SPEAKING_EPSILON {
+        (rms, peak)
+    } else {
+        (0.0, peak)
+    }
+}
+
+/// Wrap an audio backend to emit RMS/peak telemetry.
+pub fn with_rms_sender(
+    audio: Arc<dyn AudioBackend>,
+    rms_tx: watch::Sender<RmsPayload>,
+) -> Arc<dyn AudioBackend> {
+    Arc::new(RmsAudioBackend { inner: audio, rms_tx })
 }
 
 /// Helper for streaming/queued audio writes that tracks first-audio timestamp.
