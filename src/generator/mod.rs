@@ -1,29 +1,29 @@
 use anyhow::{Result, bail};
 use async_trait::async_trait;
 use std::sync::Arc;
-use tokio::sync::{oneshot, watch};
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 
 use crate::audio::AudioBackend;
 use crate::internal::env;
 
-pub mod os;
-pub mod remote;
 #[cfg(all(feature = "gpt-sovits", target_os = "windows"))]
 pub mod gpt_sovits;
 #[cfg(feature = "gpt-sovits-onnx")]
 pub mod gpt_sovits_onnx;
-pub use os::OsTts;
-pub use remote::RemoteTts;
+pub mod os;
+pub mod remote;
 #[cfg(all(feature = "gpt-sovits", target_os = "windows"))]
-pub use gpt_sovits::{GptSovitsChunkPolicy, GptSovitsConfig, GptSovitsTts, build as build_gpt_sovits_tts};
+pub use gpt_sovits::{
+    GptSovitsChunkPolicy, GptSovitsConfig, GptSovitsTts, build as build_gpt_sovits_tts,
+};
 #[cfg(feature = "gpt-sovits-onnx")]
 pub use gpt_sovits_onnx::{
-    GptSovitsOnnxConfig,
-    GptSovitsOnnxSampling,
-    GptSovitsOnnxTts,
+    GptSovitsOnnxConfig, GptSovitsOnnxSampling, GptSovitsOnnxTts,
     build as build_gpt_sovits_onnx_tts,
 };
+pub use os::OsTts;
+pub use remote::RemoteTts;
 
 /// 单个 TTS 片段的生成与播放指标。
 pub struct TtsMetrics {
@@ -90,7 +90,10 @@ pub struct TtsEngineBuilder {
 
 impl TtsEngineBuilder {
     pub fn new(backend: TtsBackend) -> Self {
-        Self { backend, audio: None }
+        Self {
+            backend,
+            audio: None,
+        }
     }
 
     pub fn audio_backend(mut self, audio: Arc<dyn AudioBackend>) -> Self {
@@ -104,18 +107,18 @@ impl TtsEngineBuilder {
             TtsBackend::Remote => Ok(Arc::new(RemoteTts::new()?)),
             #[cfg(all(feature = "gpt-sovits", target_os = "windows"))]
             TtsBackend::GptSovits(config) => {
-                let audio = self
-                    .audio
-                    .ok_or_else(|| anyhow::Error::msg("GptSovits backend requires an AudioBackend"))?;
-                Ok(Arc::new(gpt_sovits::GptSovitsTts::from_config(config, audio)?))
+                let audio = self.audio.ok_or_else(|| {
+                    anyhow::Error::msg("GptSovits backend requires an AudioBackend")
+                })?;
+                Ok(Arc::new(gpt_sovits::GptSovitsTts::from_config(
+                    config, audio,
+                )?))
             }
             #[cfg(feature = "gpt-sovits-onnx")]
             TtsBackend::GptSovitsOnnx(config) => {
-                let audio = self
-                    .audio
-                    .ok_or_else(|| {
-                        anyhow::Error::msg("GptSovitsOnnx backend requires an AudioBackend")
-                    })?;
+                let audio = self.audio.ok_or_else(|| {
+                    anyhow::Error::msg("GptSovitsOnnx backend requires an AudioBackend")
+                })?;
                 Ok(Arc::new(gpt_sovits_onnx::GptSovitsOnnxTts::from_config(
                     config, audio,
                 )?))
@@ -138,15 +141,13 @@ pub fn build_from_env() -> Result<Arc<dyn TtsEngine>> {
         "os" => Ok(Arc::new(OsTts::new())),
         "gpt-sovits" => build_gpt_sovits_from_env(),
         "gpt-sovits-onnx" => build_gpt_sovits_onnx_from_env(),
-        "remote" => {
-            Ok(Arc::new(RemoteTts::new()?))
-        }
+        "remote" => Ok(Arc::new(RemoteTts::new()?)),
         _ => bail!("Unknown TTS_BACKEND: {backend}"),
     }
 }
 
 pub fn build_from_env_with_rms_sender(
-    rms_tx: watch::Sender<crate::audio::RmsPayload>,
+    rms_tx: mpsc::UnboundedSender<crate::audio::RmsPayload>,
 ) -> Result<Arc<dyn TtsEngine>> {
     let backend_raw = env::string("TTS_BACKEND").unwrap_or_else(|| default_backend().to_string());
     let backend = backend_raw

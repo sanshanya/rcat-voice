@@ -161,6 +161,13 @@ impl RemoteTtsInner {
                 continue;
             }
 
+            tracing::info!(
+                "RemoteTts: HTTP chunk {} bytes -> {} samples ({:.1}ms)",
+                chunk.len(),
+                sample_buf.len(),
+                sample_buf.len() as f64 / 32.0 // ms at 32kHz
+            );
+
             let accepted = segment.push(&sample_buf, &cancel_scope);
             sample_buf.clear();
             if !accepted {

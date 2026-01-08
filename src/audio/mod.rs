@@ -1,7 +1,7 @@
 use anyhow::{Result, bail};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::sync::{oneshot, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 
 use crate::internal::env;
@@ -23,6 +23,8 @@ pub struct RmsPayload {
     pub peak: f32,
     pub buffered_ms: u64,
     pub speaking: bool,
+    /// Monotonic sequence number to prevent watch channel deduplication.
+    pub seq: u64,
 }
 
 /// Cancellation token for audio synthesis/playback.
@@ -77,17 +79,18 @@ const RMS_SPEAKING_EPSILON: f32 = 1.0e-4;
 
 struct RmsAudioBackend {
     inner: Arc<dyn AudioBackend>,
-    rms_tx: watch::Sender<RmsPayload>,
+    rms_tx: mpsc::UnboundedSender<RmsPayload>,
 }
 
 struct RmsSegmentWriter {
     inner: Box<dyn SegmentWriter>,
     audio: Arc<dyn AudioBackend>,
-    rms_tx: watch::Sender<RmsPayload>,
+    rms_tx: mpsc::UnboundedSender<RmsPayload>,
+    seq: u64,
 }
 
 impl RmsSegmentWriter {
-    fn emit(&self, samples: &[f32], speaking: bool) {
+    fn emit(&mut self, samples: &[f32], speaking: bool) {
         if samples.is_empty() {
             return;
         }
@@ -102,11 +105,21 @@ impl RmsSegmentWriter {
         // `buffered_ms()` is sampled after writing the chunk, so it includes this chunk.
         // Subtract the chunk duration to approximate "time until this chunk starts playing".
         let buffered_ms = buffered_ms_after.saturating_sub(chunk_ms);
+        self.seq = self.seq.wrapping_add(1);
+        tracing::info!(
+            "RMS emit: seq={} rms={:.4} peak={:.4} buf_ms={} speak={}",
+            self.seq,
+            rms,
+            peak,
+            buffered_ms,
+            speaking
+        );
         let _ = self.rms_tx.send(RmsPayload {
             rms,
             peak,
             buffered_ms,
             speaking,
+            seq: self.seq,
         });
     }
 }
@@ -125,18 +138,13 @@ impl SegmentWriter for RmsSegmentWriter {
     fn finish(self: Box<Self>, cancelled: bool) -> SegmentPlayback {
         let RmsSegmentWriter {
             inner,
-            audio,
-            rms_tx,
+            audio: _,
+            rms_tx: _,
+            seq: _,
         } = *self;
-        let playback = inner.finish(cancelled);
-        let buffered_ms = audio.buffered_ms().unwrap_or(0);
-        let _ = rms_tx.send(RmsPayload {
-            rms: 0.0,
-            peak: 0.0,
-            buffered_ms,
-            speaking: false,
-        });
-        playback
+        // Do NOT emit speaking:false here - speaking state is controlled by
+        // voice-speech-start/end events, not per-segment finish.
+        inner.finish(cancelled)
     }
 
     fn first_audio_ts(&self) -> Option<Instant> {
@@ -146,22 +154,19 @@ impl SegmentWriter for RmsSegmentWriter {
 
 impl AudioBackend for RmsAudioBackend {
     fn begin_segment(&self) -> Box<dyn SegmentWriter> {
+        tracing::info!("RMS: new segment writer created");
         Box::new(RmsSegmentWriter {
             inner: self.inner.begin_segment(),
             audio: Arc::clone(&self.inner),
             rms_tx: self.rms_tx.clone(),
+            seq: 0,
         })
     }
 
     fn stop(&self) {
         self.inner.stop();
-        let buffered_ms = self.inner.buffered_ms().unwrap_or(0);
-        let _ = self.rms_tx.send(RmsPayload {
-            rms: 0.0,
-            peak: 0.0,
-            buffered_ms,
-            speaking: false,
-        });
+        // Do NOT emit speaking:false here - speaking state is controlled by
+        // voice-speech-start/end events, not stop.
     }
 
     fn sample_rate(&self) -> u32 {
@@ -201,9 +206,12 @@ fn rms_and_peak(samples: &[f32]) -> (f32, f32) {
 /// Wrap an audio backend to emit RMS/peak telemetry.
 pub fn with_rms_sender(
     audio: Arc<dyn AudioBackend>,
-    rms_tx: watch::Sender<RmsPayload>,
+    rms_tx: mpsc::UnboundedSender<RmsPayload>,
 ) -> Arc<dyn AudioBackend> {
-    Arc::new(RmsAudioBackend { inner: audio, rms_tx })
+    Arc::new(RmsAudioBackend {
+        inner: audio,
+        rms_tx,
+    })
 }
 
 /// Helper for streaming/queued audio writes that tracks first-audio timestamp.
@@ -221,6 +229,9 @@ impl AudioStreamSegment {
     }
 
     /// Push a chunk of samples into the segment. Returns `false` when playback should stop.
+    ///
+    /// For smooth lip-sync, large chunks are split into smaller pieces (~50ms) so that
+    /// RMS events are emitted more frequently.
     pub fn push(&mut self, samples: &[f32], cancel: &CancelScope) -> bool {
         if cancel.is_cancelled() {
             return false;
@@ -229,13 +240,31 @@ impl AudioStreamSegment {
             return true;
         }
 
-        let written = self.segment.push(samples, cancel);
-        if written == 0 {
-            return false;
+        // Split into ~50ms chunks for more frequent RMS emission
+        // At 32kHz mono: 50ms = 1600 samples
+        const RMS_CHUNK_SAMPLES: usize = 1600;
+
+        let mut offset = 0;
+        while offset < samples.len() {
+            if cancel.is_cancelled() {
+                return false;
+            }
+
+            let end = (offset + RMS_CHUNK_SAMPLES).min(samples.len());
+            let chunk = &samples[offset..end];
+
+            let written = self.segment.push(chunk, cancel);
+            if written == 0 {
+                return false;
+            }
+
+            if self.first_audio_ts.is_none() {
+                self.first_audio_ts = self.segment.first_audio_ts();
+            }
+
+            offset += written;
         }
-        if self.first_audio_ts.is_none() {
-            self.first_audio_ts = self.segment.first_audio_ts();
-        }
+
         true
     }
 
