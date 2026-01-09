@@ -106,7 +106,7 @@ impl RmsSegmentWriter {
         // Subtract the chunk duration to approximate "time until this chunk starts playing".
         let buffered_ms = buffered_ms_after.saturating_sub(chunk_ms);
         self.seq = self.seq.wrapping_add(1);
-        tracing::info!(
+        tracing::debug!(
             "RMS emit: seq={} rms={:.4} peak={:.4} buf_ms={} speak={}",
             self.seq,
             rms,
