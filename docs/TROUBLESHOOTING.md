@@ -1,69 +1,222 @@
-# Troubleshooting（Windows / 混用原生依赖）
+# 故障排查 (Troubleshooting)
 
-本页记录近期在 Windows 上落地时遇到的关键问题、排查结论与推荐方案。
+本文档记录常见问题和解决方案。
 
-## 1) `gpt-sovits`（libtorch/tch）进程内崩溃：`0xc0000374 STATUS_HEAP_CORRUPTION`
+## 平台说明
 
-**现象**
+本文档主要针对 **Windows** 平台。Linux/macOS 用户可跳过 Windows 特定章节。
 
-- 进程直接退出，Windows 报错 `0xc0000374 STATUS_HEAP_CORRUPTION`。
-- 常见触发点在 GPT-SoVITS 初始化/推理阶段（如 `SpeakerV2Pro::pre_handle_ref` 附近），没有 Rust backtrace。
+---
 
-**判断**
+## Windows 问题
 
-- 这是典型的 **native heap corruption**（内存被写坏/错 free），通常由 **多个大型原生运行时在同进程混用** 引起（libtorch/CUDA + ONNX Runtime + 其它 C/C++ 依赖）。
-- `KMP_DUPLICATE_LIB_OK=TRUE` 只对部分 OpenMP 重复加载问题有效，无法保证不崩。
+### STATUS_HEAP_CORRUPTION 崩溃
 
-**最稳妥方案（推荐）**
+**现象:**
+- 进程直接退出，报错 `0xc0000374 STATUS_HEAP_CORRUPTION`
+- 常见于 GPT-SoVITS 初始化阶段
 
-- **应用内（例如 Tauri）优先使用 `gpt-sovits-onnx`**（不加载 libtorch），将 GPU TTS 留给独立进程：
-  - 进程隔离 worker（本机 HTTP，OpenAI 风格接口 `/v1/audio/speech`）。
+**原因:**
+多个原生运行时混用 (libtorch/CUDA + ONNX Runtime) 导致内存冲突。
 
-本仓库内置了一个最小 worker（流式 `pcm16le`）：
+**解决方案:**
 
+| 方案 | 说明 | 推荐度 |
+|------|------|-------|
+| 使用 `gpt-sovits-onnx` | 不加载 libtorch | ⭐⭐⭐ |
+| 进程隔离 TTS Worker | HTTP 接口隔离 | ⭐⭐⭐ |
+| `KMP_DUPLICATE_LIB_OK=TRUE` | 可能缓解，不保证 | ⭐ |
+
+**进程隔离示例:**
 ```powershell
-cd rcat-voice
+# 终端 1: 启动 Worker
+$env:GSV_MODEL_DIR = "v2pro"
 cargo run --bin tts_worker --features tts-worker --release
+
+# 终端 2: 主应用
+$env:TTS_BACKEND = "remote"
+$env:TTS_REMOTE_BASE_URL = "http://127.0.0.1:7878"
 ```
 
-**可尝试的缓解（不保证）**
+相关代码: [voice_assistant.rs](../examples/voice_assistant.rs)
 
-- `KMP_DUPLICATE_LIB_OK=TRUE`：可能缓解 OpenMP 运行时冲突，但可能影响性能/线程配置。
-- 确保同一进程内不要同时加载多份不同来源的 OpenMP/CRT（很难完全手工保证）。
+---
 
-## 2) `GSV_FP16=0`（fp32 输入）导致 TorchScript 报错
+### GPT-SoVITS FP16 报错
 
-**现象**
+**现象:**
+```
+RuntimeError: Input type (CUDAFloatType) and weight type (CUDAHalfType) should be the same
+```
 
-- `GSV_FP16=0` 后，可能出现类似错误：
-  - `RuntimeError: Input type (CUDAFloatType) and weight type (CUDAHalfType) should be the same`
-- 上游库可能只返回固定文案（需要打开 debug 日志才能看到真实 TorchScript 栈）。
+**原因:**
+TorchScript 权重为 half-only (fp16)，不支持 fp32 输入。
 
-**结论**
+**解决方案:**
+保持 `GSV_FP16=1` (默认)。
 
-- 你当前使用的 CUDA TorchScript 权重/算子链很可能是 **half-only**（权重是 Half，要求输入也是 Half）。
-- 这意味着：在不更换/重导权重的前提下，**只能用 fp16 跑通**。
+如需调试:
+```powershell
+$env:RUST_LOG = "gpt_sovits_rs=debug"
+```
 
-**建议**
+---
 
-- 保持 `GSV_FP16=1`（默认）来匹配 half-only 权重。
-- 若确实要 fp32：需要一套 fp32 兼容的导出（权重/算子链必须支持 Float）。
+### Smart Turn CPU/GPU 选择
 
-## 3) Smart Turn：CPU/GPU ONNX 混用与选择
+**配置方式:**
+```powershell
+$env:SMART_TURN_VARIANT = "gpu"  # 或 "cpu"
+```
 
-**建议**
+**注意:** `smart-turn-rs` 当前只支持 CPU execution provider。GPU 模型仍会在 CPU 上运行。
 
-- 若 `SMART_TURN_MODEL` 指向目录且目录里同时有 `*-cpu.onnx`/`*-gpu.onnx`：
-  - 用 `SMART_TURN_VARIANT=gpu|cpu` 选择（默认 `gpu`）。
-- 在 Windows 上若同时使用 `TTS_BACKEND=gpt-sovits`：
-  - 已对 `smart-turn-*-cpu.onnx` 做了 fail-fast（默认拒绝）以避免已观测到的崩溃路径；
-  - 如需强行使用：`SMART_TURN_ALLOW_CPU_MODEL=1`（不推荐）。
+**建议:** 使用 CPU 版模型 (~8MB)，推理 <5ms。
 
-## 4) 日志与可观测性
+---
 
-- 打开 GPT-SoVITS 上游库 debug（用于看到真实 TorchScript 错误）：
-  - `RUST_LOG=gpt_sovits_rs=debug`
-- 打开本项目的文本/流式指标：
-  - `VOICE_TTS_METRICS=1`（推荐，总开关；也会联动开启 `GSV_TEXT_METRICS`）
-  - `TTS_WORKER_METRICS=1`（仅 worker 进程请求指标）
-  - `GSV_TEXT_METRICS=1`（仅 GPT-SoVITS 文本/推理阶段）
+## 跨平台问题
+
+### 首轮响应慢
+
+**现象:** 首次对话延迟明显高于后续。
+
+**原因:** 模型冷启动。
+
+**解决方案:** 已实现模型预热，检查日志:
+```
+smart_turn warmup complete
+tts warmup complete
+```
+
+相关代码: [voice_assistant.rs:237-257](../examples/voice_assistant.rs#L237-L257)
+
+---
+
+### 误打断频繁
+
+**现象:** 助手说话时频繁被打断，即使用户没说话。
+
+**原因:** 能量阈值过低或确认窗口过短。
+
+**解决方案:**
+```powershell
+$env:BARGE_IN_CONFIRM_MS = "150"       # 增大确认窗口
+$env:BARGE_IN_MIN_SPEECH_MS = "600"    # 增大触发时长
+```
+
+相关代码: [voice_assistant.rs:168-173](../examples/voice_assistant.rs#L168-L173)
+
+---
+
+### LLM 延迟不稳定
+
+**现象:** 不同轮次的 LLM 响应时间差异大。
+
+**原因:** 每轮新建连接导致 TTFB 波动。
+
+**解决方案:** 确认 LLM Client 复用生效。查看日志只有一次连接建立。
+
+相关代码: [voice_assistant.rs:70-74](../examples/voice_assistant.rs#L70-L74)
+
+---
+
+### TTS 音频断断续续
+
+**现象:** 语音播放有明显停顿。
+
+**原因:** 环形缓冲区满导致阻塞。
+
+**解决方案:**
+
+1. 启用指标:
+```powershell
+$env:AUDIO_RING_METRICS = "1"
+```
+
+2. 观察日志 `ring_buffer: blocked Xus`
+
+3. 如阻塞频繁，调整缓冲:
+```powershell
+$env:AUDIO_RING_SECONDS = "90"
+$env:AUDIO_PREFILL_MS = "100"
+```
+
+相关代码: [rodio.rs:406-407](../src/audio/rodio.rs#L406-L407)
+
+---
+
+### ASR 识别不准
+
+**现象:** 语音识别错误率高。
+
+**可能原因:**
+1. VAD 分段不准
+2. 模型不匹配
+
+**解决方案:**
+
+调整 VAD:
+```powershell
+$env:ASR_VAD_MIN_SILENCE = "0.5"   # 增大
+$env:ASR_VAD_THRESHOLD = "0.6"    # 增大
+```
+
+切换模型:
+```powershell
+$env:ASR_MODEL = "funasr-nano-int8"  # 推荐
+```
+
+---
+
+### 环境变量不生效
+
+**现象:** 设置了环境变量但程序行为没变。
+
+**原因 (Windows):** 使用了 PowerShell 变量语法。
+
+**错误:**
+```powershell
+$KEY = "value"  # 这是 PowerShell 变量，不传给子进程
+```
+
+**正确:**
+```powershell
+$env:KEY = "value"  # 这是环境变量
+```
+
+---
+
+### 模型路径错误
+
+**现象:**
+```
+SMART_TURN_MODEL not found: path/to/model.onnx
+```
+
+**解决方案:**
+1. 确认路径存在
+2. Windows 使用反斜杠或正斜杠都可以
+3. 可以指定目录，自动查找 `smart-turn*.onnx`
+
+---
+
+## 调试开关
+
+| 变量 | 用途 |
+|------|------|
+| `RUST_LOG=rcat_voice=debug` | 本项目 debug 日志 |
+| `RUST_LOG=gpt_sovits_rs=debug` | GPT-SoVITS 上游库 |
+| `AUDIO_RING_METRICS=1` | Ring Buffer 阻塞指标 |
+| `VOICE_TTS_METRICS=1` | TTS 时间线指标 |
+| `ASR_INFER_LOG=1` | ASR 推理耗时 |
+| `TOKENIZER_RELAX_LOG=1` | 分句 Relax 状态 |
+
+---
+
+## 相关文档
+
+- [README.md](./README.md) - 文档索引
+- [ARCHITECTURE.md](./ARCHITECTURE.md) - 系统架构
+- [FEATURE_MAP.md](./FEATURE_MAP.md) - 功能-代码映射
+- [OPTIMIZATIONS.md](./OPTIMIZATIONS.md) - 优化建议

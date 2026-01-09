@@ -1,15 +1,15 @@
-use anyhow::Result;
 use super::{AudioBackend, CancelScope, RodioConfig, SegmentPlayback, SegmentWriter};
+use anyhow::Result;
+use crossbeam_queue::ArrayQueue;
 use rodio::source::SeekError;
 use rodio::{OutputStream, OutputStreamBuilder, Source};
-use crossbeam_queue::ArrayQueue;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::sync::oneshot;
 use tokio::time::Instant;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 const MARKER_CHECK_INTERVAL: u64 = 256;
 
@@ -79,20 +79,20 @@ impl RodioBackend {
 
         let playback = Arc::new(PlaybackState::new(prebuffer_samples));
         let ring = Arc::new(RingBuffer::new(ring_capacity));
-        stream
-            .mixer()
-            .add(RingBufferSource::new(
-                ring.clone(),
-                playback.clone(),
-                config.sample_rate,
-                config.channels,
-            ));
+        stream.mixer().add(RingBufferSource::new(
+            ring.clone(),
+            playback.clone(),
+            config.sample_rate,
+            config.channels,
+        ));
         info!(
             "Audio ring buffer: {}s ({} samples)",
-            config.ring_seconds,
-            ring_capacity
+            config.ring_seconds, ring_capacity
         );
-        info!("Audio format: {}Hz, {}ch", config.sample_rate, config.channels);
+        info!(
+            "Audio format: {}Hz, {}ch",
+            config.sample_rate, config.channels
+        );
         info!(
             "Audio prebuffer: {}ms ({} samples)",
             config.prefill_ms, prebuffer_samples
@@ -317,7 +317,10 @@ impl PlaybackState {
 
     fn reset(&self) {
         self.started.store(false, Ordering::Release);
-        *self.stream_start.lock().expect("stream start lock poisoned") = None;
+        *self
+            .stream_start
+            .lock()
+            .expect("stream start lock poisoned") = None;
         self.played_samples.store(0, Ordering::Release);
         self.written_samples.store(0, Ordering::Release);
         self.consumed_samples.store(0, Ordering::Release);
@@ -332,7 +335,10 @@ impl PlaybackState {
             return None;
         }
         let now = Instant::now();
-        let mut guard = self.stream_start.lock().expect("stream start lock poisoned");
+        let mut guard = self
+            .stream_start
+            .lock()
+            .expect("stream start lock poisoned");
         if guard.is_none() {
             *guard = Some(now);
         }
@@ -346,14 +352,20 @@ impl PlaybackState {
             return ts;
         }
         let now = Instant::now();
-        let mut guard = self.stream_start.lock().expect("stream start lock poisoned");
+        let mut guard = self
+            .stream_start
+            .lock()
+            .expect("stream start lock poisoned");
         *guard = Some(now);
         self.started.store(true, Ordering::Release);
         now
     }
 
     fn stream_start(&self) -> Option<Instant> {
-        *self.stream_start.lock().expect("stream start lock poisoned")
+        *self
+            .stream_start
+            .lock()
+            .expect("stream start lock poisoned")
     }
 
     fn push_marker(&self, end_sample: u64, done_tx: oneshot::Sender<Instant>) {
@@ -362,28 +374,22 @@ impl PlaybackState {
             let _ = done_tx.send(Instant::now());
             return;
         }
-        let mut markers = self
-            .markers
-            .lock()
-            .expect("playback marker lock poisoned");
-        markers.push_back(PlayMarker { end_sample, done_tx });
+        let mut markers = self.markers.lock().expect("playback marker lock poisoned");
+        markers.push_back(PlayMarker {
+            end_sample,
+            done_tx,
+        });
     }
 
     fn clear_markers(&self) {
-        let mut markers = self
-            .markers
-            .lock()
-            .expect("playback marker lock poisoned");
+        let mut markers = self.markers.lock().expect("playback marker lock poisoned");
         while let Some(marker) = markers.pop_front() {
             let _ = marker.done_tx.send(Instant::now());
         }
     }
 
     fn check_markers(&self, consumed_samples: u64) {
-        let mut markers = self
-            .markers
-            .lock()
-            .expect("playback marker lock poisoned");
+        let mut markers = self.markers.lock().expect("playback marker lock poisoned");
         while let Some(marker) = markers.front() {
             if marker.end_sample > consumed_samples {
                 break;
@@ -397,18 +403,24 @@ impl PlaybackState {
 
 struct RingBuffer {
     queue: ArrayQueue<f32>,
+    full_count: AtomicU64,
+    blocked_us: AtomicU64,
 }
 
 impl RingBuffer {
     fn new(cap: usize) -> Self {
         Self {
             queue: ArrayQueue::new(cap),
+            full_count: AtomicU64::new(0),
+            blocked_us: AtomicU64::new(0),
         }
     }
 
     fn push_blocking(&self, data: &[f32], cancel: &CancelScope) -> usize {
+        let start = std::time::Instant::now();
         let mut written = 0usize;
         let mut backoff = 0u32;
+        let mut full_events = 0u64;
         while written < data.len() {
             if cancel.is_cancelled() {
                 break;
@@ -419,9 +431,24 @@ impl RingBuffer {
                     backoff = 0;
                 }
                 Err(_) => {
+                    full_events += 1;
                     let delay_us = 100u64 << backoff.min(3);
                     std::thread::sleep(Duration::from_micros(delay_us));
                     backoff = backoff.saturating_add(1);
+                }
+            }
+        }
+        // Track metrics
+        if full_events > 0 {
+            self.full_count.fetch_add(full_events, Ordering::Relaxed);
+            let elapsed_us = start.elapsed().as_micros() as u64;
+            if elapsed_us >= 1000 {
+                self.blocked_us.fetch_add(elapsed_us, Ordering::Relaxed);
+                if std::env::var("AUDIO_RING_METRICS").is_ok() {
+                    debug!(
+                        "ring_buffer: blocked {}us ({} full events)",
+                        elapsed_us, full_events
+                    );
                 }
             }
         }

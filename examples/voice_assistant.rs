@@ -64,9 +64,14 @@ async fn main() -> Result<()> {
         std::env::var("OPENAI_API_KEY")
             .context("OPENAI_API_KEY is required for voice_assistant example")?,
     );
-    let model = Arc::new(
-        std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "deepseek-chat".to_string()),
-    );
+    let model =
+        Arc::new(std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "deepseek-chat".to_string()));
+
+    // Create shared LLM client once (reuse connection pool across turns)
+    let openai_config = OpenAIConfig::new()
+        .with_api_key((*api_key).clone())
+        .with_api_base((*base_url).clone());
+    let llm_client = Arc::new(Client::with_config(openai_config));
 
     let system_prompt = std::env::var("VOICE_SYSTEM_PROMPT").unwrap_or_else(|_| {
         "你是一个低延迟语音助手。回答要简洁、口语化；遇到不确定就直接说不确定。".to_string()
@@ -120,7 +125,11 @@ async fn main() -> Result<()> {
     let sample_rate = config.sample_rate.0;
     let channels = config.channels;
     if sample_rate == 0 || channels == 0 {
-        bail!("Invalid input audio format: {}Hz/{}ch", sample_rate, channels);
+        bail!(
+            "Invalid input audio format: {}Hz/{}ch",
+            sample_rate,
+            channels
+        );
     }
 
     let ring_capacity = (sample_rate as usize)
@@ -131,19 +140,19 @@ async fn main() -> Result<()> {
     let queue: Arc<ArrayQueue<i16>> = Arc::new(ArrayQueue::new(ring_capacity));
     let dropped = Arc::new(AtomicU64::new(0));
 
-    let stream = build_cpal_stream(&device, &config, sample_format, queue.clone(), dropped.clone())
-        .context("failed to build input stream")?;
+    let stream = build_cpal_stream(
+        &device,
+        &config,
+        sample_format,
+        queue.clone(),
+        dropped.clone(),
+    )
+    .context("failed to build input stream")?;
     stream.play().context("failed to start input stream")?;
 
     info!(
         "voice_assistant: device={} format={:?} input={}Hz/{}ch feed_ms={} ring={}s cap_samples={}",
-        device_name,
-        sample_format,
-        sample_rate,
-        channels,
-        feed_ms,
-        ring_seconds,
-        ring_capacity
+        device_name, sample_format, sample_rate, channels, feed_ms, ring_seconds, ring_capacity
     );
     info!("voice_assistant: press Ctrl+C to stop");
 
@@ -155,6 +164,13 @@ async fn main() -> Result<()> {
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(450)
         .clamp(50, 10_000);
+
+    // Dual-gate barge-in: require consecutive non-silence frames before counting as speech
+    let barge_in_confirm_ms = std::env::var("BARGE_IN_CONFIRM_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(100)
+        .clamp(0, 1000);
 
     #[cfg(feature = "turn-smart")]
     let turn_min_silence_ms = std::env::var("SMART_TURN_MIN_SILENCE_MS")
@@ -218,17 +234,41 @@ async fn main() -> Result<()> {
         _ => None,
     };
 
-    let mut messages: Vec<ChatCompletionRequestMessage> = vec![ChatCompletionRequestMessage::System(
-        ChatCompletionRequestSystemMessageArgs::default()
-            .content(system_prompt)
-            .build()?,
-    )];
+    // === Model Warmup (eliminate first-turn latency spikes) ===
+    #[cfg(feature = "turn-smart")]
+    if let Some(detector) = smart_turn.as_mut() {
+        // Smart Turn warmup: predict on 8s of silence (16kHz mono)
+        let zeros = vec![0i16; 16000 * 8];
+        if let Err(e) = detector.push_pcm_i16(&zeros, 16000, 1) {
+            warn!("Smart turn warmup failed: {e}");
+        } else {
+            let _ = detector
+                .model()
+                .predict_probability(&detector.snapshot_audio());
+            detector.reset();
+            info!("voice_assistant: smart_turn warmup complete");
+        }
+    }
+
+    // TTS warmup: synthesize minimal text and discard
+    match tts_engine.synthesize("。").await {
+        Ok(_) => info!("voice_assistant: tts warmup complete"),
+        Err(e) => warn!("TTS warmup failed: {e}"),
+    }
+
+    let mut messages: Vec<ChatCompletionRequestMessage> =
+        vec![ChatCompletionRequestMessage::System(
+            ChatCompletionRequestSystemMessageArgs::default()
+                .content(system_prompt)
+                .build()?,
+        )];
     trim_history(&mut messages, history_max_messages);
 
     let mut assistant: Option<RunningAssistant> = None;
 
     let mut turn_text = String::new();
     let mut speech_streak_ms: u64 = 0;
+    let mut consecutive_non_silence_ms: u64 = 0; // Dual-gate confirmation counter
 
     #[cfg(feature = "turn-smart")]
     let mut smart_turn_threshold = smart_turn.as_ref().map(|d| d.threshold()).unwrap_or(0.5);
@@ -275,6 +315,10 @@ async fn main() -> Result<()> {
                     let finished = assistant.take().expect("assistant");
                     match finished.handle.await {
                         Ok(Ok(result)) => {
+                            if !result.cancelled {
+                                let turn_to_finish_ms = result.turn_end_ts.elapsed().as_millis();
+                                info!("voice_assistant: turn_to_finish_ms={}", turn_to_finish_ms);
+                            }
                             if !result.cancelled && !result.text.trim().is_empty() {
                                 messages.push(ChatCompletionRequestMessage::Assistant(
                                     ChatCompletionRequestAssistantMessageArgs::default()
@@ -301,20 +345,31 @@ async fn main() -> Result<()> {
                 }
 
                 if chunk.len() >= chunk_samples {
+                    // Dual-gate barge-in:
+                    // Gate 1 (coarse): energy threshold
                     let is_silence = is_silence_chunk(&chunk, barge_in_silence_abs);
+
                     if is_silence {
+                        // Reset both counters on silence
+                        consecutive_non_silence_ms = 0;
                         speech_streak_ms = 0;
                     } else {
-                        speech_streak_ms = speech_streak_ms.saturating_add(feed_ms);
+                        // Gate 2 (confirmation): require consecutive non-silence frames
+                        consecutive_non_silence_ms = consecutive_non_silence_ms.saturating_add(feed_ms);
+                        if consecutive_non_silence_ms >= barge_in_confirm_ms {
+                            // Only count towards speech after confirmation window passed
+                            speech_streak_ms = speech_streak_ms.saturating_add(feed_ms);
+                        }
                     }
 
                     if let Some(running) = assistant.as_mut() {
                         if !running.cancel_requested && speech_streak_ms >= barge_in_min_speech_ms {
                             warn!(
-                                "voice_assistant: barge-in detected (speech_ms={} >= {}), cancelling assistant",
-                                speech_streak_ms, barge_in_min_speech_ms
+                                "voice_assistant: barge-in detected (speech_ms={} >= {}, confirm_ms={}), cancelling assistant",
+                                speech_streak_ms, barge_in_min_speech_ms, barge_in_confirm_ms
                             );
                             speech_streak_ms = 0;
+                            consecutive_non_silence_ms = 0;
                             running.cancel_requested = true;
                             let _ = running.cancel_tx.send(true);
                             let cancel_handle = running.cancel_handle.clone();
@@ -385,10 +440,10 @@ async fn main() -> Result<()> {
                             assistant = Some(
                                 start_assistant(
                                     tts_engine.clone(),
-                                    base_url.clone(),
-                                    api_key.clone(),
+                                    llm_client.clone(),
                                     model.clone(),
                                     messages.clone(),
+                                    std::time::Instant::now(),
                                 )
                                 .await?,
                             );
@@ -456,10 +511,10 @@ async fn main() -> Result<()> {
                         println!("USER: {user_text}");
                         assistant = Some(start_assistant(
                             tts_engine.clone(),
-                            base_url.clone(),
-                            api_key.clone(),
+                            llm_client.clone(),
                             model.clone(),
                             messages.clone(),
+                            std::time::Instant::now(),
                         ).await?);
                     } else if trailing_silence_ms >= turn_min_silence_ms {
                         let now = Instant::now();
@@ -504,10 +559,10 @@ async fn main() -> Result<()> {
                             println!("USER: {user_text}");
                             assistant = Some(start_assistant(
                                 tts_engine.clone(),
-                                base_url.clone(),
-                                api_key.clone(),
+                                llm_client.clone(),
                                 model.clone(),
                                 messages.clone(),
+                                std::time::Instant::now(),
                             ).await?);
                         }
                     }
@@ -528,6 +583,7 @@ async fn main() -> Result<()> {
 struct LlmResult {
     text: String,
     cancelled: bool,
+    turn_end_ts: std::time::Instant,
 }
 
 #[cfg(all(feature = "asr-sherpa", feature = "asr-mic"))]
@@ -552,10 +608,10 @@ async fn stop_running(mut running: RunningAssistant) -> Result<()> {
 #[cfg(all(feature = "asr-sherpa", feature = "asr-mic"))]
 async fn start_assistant(
     tts_engine: Arc<dyn rcat_voice::generator::TtsEngine>,
-    base_url: Arc<String>,
-    api_key: Arc<String>,
+    client: Arc<Client<OpenAIConfig>>,
     model: Arc<String>,
     messages: Vec<ChatCompletionRequestMessage>,
+    turn_end_ts: std::time::Instant,
 ) -> Result<RunningAssistant> {
     let session = StreamSession::from_env(tts_engine);
     let cancel_handle = session.cancel_handle();
@@ -571,15 +627,8 @@ async fn start_assistant(
     let llm_cancel = cancel_rx.clone();
     let drain_cancel = cancel_rx.clone();
     let handle = tokio::spawn(async move {
-        let result = stream_chat(
-            base_url,
-            api_key,
-            model,
-            messages,
-            delta_tx,
-            llm_cancel,
-        )
-        .await?;
+        let result =
+            stream_chat(client, model, messages, delta_tx, llm_cancel, turn_end_ts).await?;
         session.finish_or_cancel(drain_cancel).await?;
         Ok(result)
     });
@@ -594,18 +643,13 @@ async fn start_assistant(
 
 #[cfg(all(feature = "asr-sherpa", feature = "asr-mic"))]
 async fn stream_chat(
-    base_url: Arc<String>,
-    api_key: Arc<String>,
+    client: Arc<Client<OpenAIConfig>>,
     model: Arc<String>,
     messages: Vec<ChatCompletionRequestMessage>,
     delta_tx: mpsc::Sender<String>,
     mut cancel: watch::Receiver<bool>,
+    turn_end_ts: std::time::Instant,
 ) -> Result<LlmResult> {
-    let config = OpenAIConfig::new()
-        .with_api_key((*api_key).clone())
-        .with_api_base((*base_url).clone());
-    let client = Client::with_config(config);
-
     let request = CreateChatCompletionRequestArgs::default()
         .model((*model).clone())
         .messages(messages)
@@ -651,7 +695,11 @@ async fn stream_chat(
     }
 
     println!();
-    Ok(LlmResult { text, cancelled })
+    Ok(LlmResult {
+        text,
+        cancelled,
+        turn_end_ts,
+    })
 }
 
 #[cfg(all(feature = "asr-sherpa", feature = "asr-mic"))]
@@ -685,10 +733,7 @@ fn select_input_device(host: &cpal::Host, hint: Option<String>) -> Result<cpal::
         devices.push((name, device));
     }
 
-    if let Some(hint) = hint
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-    {
+    if let Some(hint) = hint.map(|v| v.trim().to_string()).filter(|v| !v.is_empty()) {
         let needle = hint.to_lowercase();
         if let Some(index) = devices
             .iter()
@@ -701,9 +746,7 @@ fn select_input_device(host: &cpal::Host, hint: Option<String>) -> Result<cpal::
             .map(|(name, _)| format!("- {name}"))
             .collect::<Vec<_>>()
             .join("\n");
-        bail!(
-            "ASR_MIC_DEVICE={hint} did not match any input device. Available:\n{available}"
-        );
+        bail!("ASR_MIC_DEVICE={hint} did not match any input device. Available:\n{available}");
     }
 
     host.default_input_device()
