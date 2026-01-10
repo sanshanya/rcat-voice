@@ -5,24 +5,48 @@ use crate::pipeline::{Pipeline, PipelineConfig};
 use crate::tokenizer::{Segment, Tokenizer, TokenizerConfig};
 use std::sync::{Arc, OnceLock};
 use tokio::sync::{mpsc, watch};
-use tokio::task::JoinHandle;
+use tokio::task::{AbortHandle, JoinHandle};
 use tokio::time::{Duration, Instant};
 use tracing::debug;
 
+/// Internal handles for O(1) cancellation.
+/// 
+/// Phase 3 fix: abort receiver tasks to make upstream send() fail immediately.
 #[derive(Clone)]
 struct SessionCancel {
     cancel_tx: watch::Sender<bool>,
     interrupt_tx: watch::Sender<u64>,
     tts_engine: Arc<dyn TtsEngine>,
+    /// Abort handle for tokenizer task (holds delta_rx)
+    tokenizer_abort: AbortHandle,
+    /// Abort handle for pipeline task (holds chunk_rx)
+    pipeline_abort: AbortHandle,
 }
 
 impl SessionCancel {
+    /// Interrupt current turn: O(1) cancel path.
+    /// 
+    /// Order: 
+    /// 1. stop_fast() -> epoch++ (invalidates all CancelScopes immediately)
+    /// 2. abort tasks (drops receivers, makes send() fail)
+    /// 3. optional signal (for compatibility)
     async fn interrupt(&self) -> Result<()> {
+        // Step 1: Stop TTS and increment epoch (MUST be first!)
+        // This is the authority - makes all CancelScope.is_cancelled() == true
+        // stop_fast() is O(1), only sets flag and clears ring buffer
+        self.tts_engine.stop_fast();
+        
+        // Step 2: Abort tokenizer and pipeline (drops receivers)
+        // O(1) - just sets abort flag
+        self.tokenizer_abort.abort();
+        self.pipeline_abort.abort();
+        
+        // Step 3: Signal interrupt (for compatibility with Pipeline epoch logic)
         let next = self.interrupt_tx.borrow().wrapping_add(1);
         if let Err(e) = self.interrupt_tx.send(next) {
             debug!("stream: interrupt signal send failed: {e:?}");
         }
-        self.tts_engine.stop().await?;
+        
         Ok(())
     }
 
@@ -32,23 +56,34 @@ impl SessionCancel {
         self.interrupt().await
     }
 
+    /// Cancel session: O(1) cancel path.
     async fn cancel(&self) -> Result<()> {
+        // Step 1: Stop TTS and increment epoch (authority for CancelScope)
+        self.tts_engine.stop_fast();
+        
+        // Step 2: Abort tokenizer and pipeline
+        self.tokenizer_abort.abort();
+        self.pipeline_abort.abort();
+        
+        // Step 3: Signal cancellation (for compatibility)
         if let Err(e) = self.cancel_tx.send(true) {
             debug!("stream: cancel signal send failed: {e:?}");
         }
-        self.tts_engine.stop().await?;
+        
         Ok(())
     }
 
-    async fn cancel_best_effort(&self) {
-        if let Err(e) = self.cancel_tx.send(true) {
-            debug!("stream: cancel signal send failed: {e:?}");
-        }
-        if let Err(e) = self.tts_engine.stop().await {
-            debug!("stream: stop failed during cancel: {e}");
-        }
+    /// Best-effort cancel without Result propagation.
+    fn cancel_best_effort(&self) {
+        // O(1) fast path
+        self.tts_engine.stop_fast();
+        self.tokenizer_abort.abort();
+        self.pipeline_abort.abort();
+        let _ = self.cancel_tx.send(true);
     }
 }
+
+
 
 /// Stream session configuration.
 #[derive(Debug, Clone)]
@@ -271,6 +306,7 @@ impl StreamSession {
             pipeline_config,
         );
         let pipeline_handle = tokio::spawn(pipeline.run());
+        let pipeline_abort = pipeline_handle.abort_handle();
 
         let tokenizer = Tokenizer::new(
             delta_rx,
@@ -283,11 +319,14 @@ impl StreamSession {
             tokenizer_config,
         );
         let tokenizer_handle = tokio::spawn(tokenizer.run());
+        let tokenizer_abort = tokenizer_handle.abort_handle();
 
         let cancel = SessionCancel {
             cancel_tx,
             interrupt_tx,
             tts_engine,
+            tokenizer_abort,
+            pipeline_abort,
         };
 
         let control = StreamControl {
@@ -352,7 +391,7 @@ impl StreamSession {
                 res = cancel.changed(), if !cancelled => {
                     if res.is_ok() && *cancel.borrow() {
                         cancelled = true;
-                        self.control.cancel.cancel_best_effort().await;
+                        self.control.cancel.cancel_best_effort();
                     }
                 }
                 _ = &mut self.tokenizer_handle, if !tokenizer_done => {
@@ -368,7 +407,7 @@ impl StreamSession {
         }
 
         if cancelled {
-            self.control.cancel.cancel_best_effort().await;
+            self.control.cancel.cancel_best_effort();
         }
 
         Ok(())

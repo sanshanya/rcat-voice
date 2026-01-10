@@ -1,7 +1,7 @@
 use anyhow::{Result, bail};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 
 use crate::internal::env;
@@ -86,11 +86,17 @@ struct RmsSegmentWriter {
     inner: Box<dyn SegmentWriter>,
     audio: Arc<dyn AudioBackend>,
     rms_tx: mpsc::UnboundedSender<RmsPayload>,
+    /// Phase 2: scope bound at creation for RMS gate
+    scope: CancelScope,
     seq: u64,
 }
 
 impl RmsSegmentWriter {
     fn emit(&mut self, samples: &[f32], speaking: bool) {
+        // Phase 2: RMS Gate - don't emit events for cancelled generation
+        if self.scope.is_cancelled() {
+            return;
+        }
         if samples.is_empty() {
             return;
         }
@@ -140,6 +146,7 @@ impl SegmentWriter for RmsSegmentWriter {
             inner,
             audio: _,
             rms_tx: _,
+            scope: _,
             seq: _,
         } = *self;
         // Do NOT emit speaking:false here - speaking state is controlled by
@@ -153,12 +160,13 @@ impl SegmentWriter for RmsSegmentWriter {
 }
 
 impl AudioBackend for RmsAudioBackend {
-    fn begin_segment(&self) -> Box<dyn SegmentWriter> {
+    fn begin_segment(&self, scope: CancelScope) -> Box<dyn SegmentWriter> {
         tracing::info!("RMS: new segment writer created");
         Box::new(RmsSegmentWriter {
-            inner: self.inner.begin_segment(),
+            inner: self.inner.begin_segment(scope.clone()),
             audio: Arc::clone(&self.inner),
             rms_tx: self.rms_tx.clone(),
+            scope,  // Phase 2: bind scope for RMS gate
             seq: 0,
         })
     }
@@ -221,9 +229,11 @@ pub struct AudioStreamSegment {
 }
 
 impl AudioStreamSegment {
-    pub fn new(audio: &dyn AudioBackend) -> Self {
+    /// Create a new segment with the given scope bound.
+    /// Phase 2: scope is captured at creation for generation gating.
+    pub fn new(audio: &dyn AudioBackend, scope: CancelScope) -> Self {
         Self {
-            segment: audio.begin_segment(),
+            segment: audio.begin_segment(scope),
             first_audio_ts: None,
         }
     }
@@ -281,8 +291,11 @@ impl AudioStreamSegment {
 
 /// 流式播放的音频后端抽象。
 pub trait AudioBackend: Send + Sync {
-    /// 开始一个新的片段写入。
-    fn begin_segment(&self) -> Box<dyn SegmentWriter>;
+    /// 开始一个新的片段写入，绑定代际权威。
+    /// 
+    /// Phase 2: scope 在 writer 创建时绑定，写入时使用内部 scope 判断，
+    /// 不依赖外部参数。这确保了旧代际的 writer 无法写入新轮次的输出域。
+    fn begin_segment(&self, scope: CancelScope) -> Box<dyn SegmentWriter>;
     /// 停止播放并清空已排队音频。
     fn stop(&self);
     /// 输出采样率（Hz）。

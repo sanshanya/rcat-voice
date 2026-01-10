@@ -5,9 +5,9 @@ use sherpa_rs::paraformer::{ParaformerConfig, ParaformerRecognizer};
 use sherpa_rs::sense_voice::{SenseVoiceConfig, SenseVoiceRecognizer};
 use sherpa_rs::silero_vad::{SileroVad, SileroVadConfig};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tokio::sync::mpsc;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::internal::{env, model_locator};
 
@@ -373,6 +373,12 @@ enum InputMsg {
     End,
 }
 
+/// Message type for communication with VAD blocking thread (P0.5 fix)
+enum VadInputMsg {
+    Samples(Vec<f32>),
+    End,
+}
+
 #[derive(Debug)]
 struct InputFormat {
     sample_rate: u32,
@@ -467,7 +473,7 @@ impl SherpaAsrStream {
             num_threads: Some(config.threads),
             debug: false,
         };
-        let mut vad = SileroVad::new(vad_cfg, config.vad.buffer_size_in_seconds)
+        let vad = SileroVad::new(vad_cfg, config.vad.buffer_size_in_seconds)
             .map_err(|e| anyhow!("failed to init SileroVad: {e}"))?;
 
         let (tx, mut in_rx) = mpsc::channel::<InputMsg>(64);
@@ -478,52 +484,43 @@ impl SherpaAsrStream {
         let vad_chunk_ms = config.vad_chunk_ms;
         let vad_chunk_samples = ((TARGET_SAMPLE_RATE as u64 * vad_chunk_ms) / 1000).max(1) as usize;
 
+        // Use std::sync::mpsc for thread-safe communication with VAD blocking thread
+        let (vad_tx, vad_rx) = std::sync::mpsc::channel::<VadInputMsg>();
+
         let join = tokio::spawn(async move {
 
             let (segment_tx, segment_rx) = mpsc::channel::<VadSegment>(segment_queue);
+
+            // VAD processing now runs in spawn_blocking to avoid blocking the reactor
+            // P0.5 fix: vad.accept_waveform() is synchronous ONNX inference
+            let vad_handle = tokio::task::spawn_blocking(move || {
+                run_vad_loop(vad, vad_rx, segment_tx, vad_chunk_samples);
+            });
+
             let infer_handle = tokio::task::spawn_blocking(move || {
                 run_inference_loop(recognizer, segment_rx, out_tx, log_infer);
             });
 
-            let mut dropped_segments: u64 = 0;
-            let mut last_drop_log = Instant::now();
-            let mut stop = false;
+            // Async task now only forwards messages to VAD thread (non-blocking)
             while let Some(msg) = in_rx.recv().await {
                 match msg {
                     InputMsg::Samples(samples) => {
                         if samples.is_empty() {
                             continue;
                         }
-                        for chunk in samples.chunks(vad_chunk_samples) {
-                            vad.accept_waveform(chunk);
-                            if enqueue_vad_segments(
-                                &mut vad,
-                                &segment_tx,
-                                &mut dropped_segments,
-                                &mut last_drop_log,
-                            ) {
-                                stop = true;
-                                break;
-                            }
+                        if vad_tx.send(VadInputMsg::Samples(samples)).is_err() {
+                            break;
                         }
                     }
                     InputMsg::End => {
-                        vad.flush();
-                        let _ = enqueue_vad_segments(
-                            &mut vad,
-                            &segment_tx,
-                            &mut dropped_segments,
-                            &mut last_drop_log,
-                        );
+                        let _ = vad_tx.send(VadInputMsg::End);
                         break;
                     }
                 }
-                if stop {
-                    break;
-                }
             }
 
-            drop(segment_tx);
+            drop(vad_tx);
+            let _ = vad_handle.await;
             let _ = infer_handle.await;
         });
 
@@ -635,11 +632,48 @@ struct VadSegment {
     end: f32,
 }
 
-fn enqueue_vad_segments(
+/// VAD processing loop that runs in spawn_blocking (P0.5 fix).
+///
+/// This function processes audio samples through Silero VAD and sends
+/// detected speech segments to the ASR inference thread. Running in
+/// spawn_blocking prevents ONNX inference from blocking the tokio reactor.
+fn run_vad_loop(
+    mut vad: SileroVad,
+    vad_rx: std::sync::mpsc::Receiver<VadInputMsg>,
+    segment_tx: mpsc::Sender<VadSegment>,
+    vad_chunk_samples: usize,
+) {
+    while let Ok(msg) = vad_rx.recv() {
+        match msg {
+            VadInputMsg::Samples(samples) => {
+                if samples.is_empty() {
+                    continue;
+                }
+                for chunk in samples.chunks(vad_chunk_samples) {
+                    // This is the key ONNX inference call that was blocking the reactor
+                    vad.accept_waveform(chunk);
+                    if enqueue_vad_segments_blocking(&mut vad, &segment_tx) {
+                        return;
+                    }
+                }
+            }
+            VadInputMsg::End => {
+                vad.flush();
+                let _ = enqueue_vad_segments_blocking(&mut vad, &segment_tx);
+                break;
+            }
+        }
+    }
+}
+
+/// Blocking version of segment enqueueing for use in spawn_blocking context.
+/// Returns true if the segment channel is closed (should stop processing).
+///
+/// Note: Unlike the original try_send version, blocking_send will block until
+/// the receiver is ready, so we don't need to track dropped segments.
+fn enqueue_vad_segments_blocking(
     vad: &mut SileroVad,
     segment_tx: &mpsc::Sender<VadSegment>,
-    dropped_segments: &mut u64,
-    last_drop_log: &mut Instant,
 ) -> bool {
     while !vad.is_empty() {
         let segment = vad.front();
@@ -658,23 +692,11 @@ fn enqueue_vad_segments(
             end,
         };
 
-        match segment_tx.try_send(segment) {
-            Ok(()) => {}
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                return true;
-            }
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                *dropped_segments = dropped_segments.saturating_add(1);
-                let now = Instant::now();
-                if now.duration_since(*last_drop_log) >= Duration::from_secs(1) {
-                    warn!(
-                        "asr: dropped {} segments (segment queue full)",
-                        *dropped_segments
-                    );
-                    *dropped_segments = 0;
-                    *last_drop_log = now;
-                }
-            }
+        // Use blocking_send since we're in spawn_blocking context.
+        // This will block until receiver is ready, providing natural backpressure.
+        if segment_tx.blocking_send(segment).is_err() {
+            // Channel closed, stop processing
+            return true;
         }
     }
     false

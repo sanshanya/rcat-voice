@@ -472,6 +472,57 @@ mod tests {
         assert_eq!(idx2, Some(20));
     }
 
+    #[test]
+    fn flush_with_chinese_punctuation() {
+        // 中文句号"。"是3字节 (U+3002)
+        // "你好世界。" = 5 chars, byte lengths: 你(3) 好(3) 世(3) 界(3) 。(3) = 15 bytes
+        let s = "你好世界。";
+        let idx = find_flush_index(s, 1, 20, 30);
+        // Should detect 。 as strong boundary and return full string length
+        assert_eq!(idx, Some(s.len())); // 15 bytes
+        assert_eq!(s.len(), 15);
+    }
+
+    #[test]
+    fn flush_with_emoji() {
+        // "Hello👍" = 6 chars, but 👍 is 4 bytes (U+1F44D)
+        // H(1) e(1) l(1) l(1) o(1) 👍(4) = 9 bytes
+        let s = "Hello👍";
+        assert_eq!(s.chars().count(), 6);
+        assert_eq!(s.len(), 9);
+        
+        // No boundary - should not flush until hard limit
+        let idx = find_flush_index(s, 1, 5, 10);
+        assert_eq!(idx, None); // Below hard_max, no boundary
+    }
+
+    #[test]
+    fn flush_with_mixed_multibyte() {
+        // Mixed: ASCII + Chinese + punctuation
+        // "Hi你好！" = 5 chars, bytes: H(1) i(1) 你(3) 好(3) ！(3) = 11 bytes
+        let s = "Hi你好！";
+        assert_eq!(s.chars().count(), 5);
+        assert_eq!(s.len(), 11);
+        
+        let idx = find_flush_index(s, 1, 10, 20);
+        // ！ is strong boundary at end
+        assert_eq!(idx, Some(s.len())); // 11 bytes
+    }
+
+    #[test]
+    fn hard_cut_respects_char_boundaries_multibyte() {
+        // "一二三四五六七八九十" = 10 chars, 30 bytes (each 3 bytes)
+        let s = "一二三四五六七八九十";
+        assert_eq!(s.chars().count(), 10);
+        assert_eq!(s.len(), 30);
+        
+        // hard_max=8 chars → should cut at char boundary (8*3=24 bytes)
+        let idx = find_flush_index(s, 1, 5, 8);
+        // hard_cut should return byte index of 8th char end
+        assert_eq!(idx, Some(24)); // 8 chars * 3 bytes = 24
+        assert!(s.is_char_boundary(24));
+    }
+
     #[tokio::test]
     async fn tokenizer_flushes_multiple_segments_from_single_delta() {
         let (delta_tx, delta_rx) = tokio::sync::mpsc::channel::<String>(8);

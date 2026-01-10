@@ -29,6 +29,8 @@ struct RodioInner {
 struct RodioSegmentWriter {
     inner: Arc<RodioInner>,
     active: bool,
+    /// Phase 2: scope bound at creation, gate uses internal scope not external param
+    scope: CancelScope,
     start_written: Option<u64>,
     written_total: u64,
     first_audio_ts: Option<Instant>,
@@ -112,7 +114,7 @@ impl RodioBackend {
 }
 
 impl AudioBackend for RodioBackend {
-    fn begin_segment(&self) -> Box<dyn SegmentWriter> {
+    fn begin_segment(&self, scope: CancelScope) -> Box<dyn SegmentWriter> {
         let active = self
             .inner
             .active_writer
@@ -126,6 +128,7 @@ impl AudioBackend for RodioBackend {
         Box::new(RodioSegmentWriter {
             inner: Arc::clone(&self.inner),
             active,
+            scope,  // Phase 2: bind scope at creation
             start_written: None,
             written_total: 0,
             first_audio_ts: None,
@@ -161,8 +164,13 @@ impl SegmentWriter for RodioSegmentWriter {
         self.first_audio_ts
     }
 
-    fn push(&mut self, samples: &[f32], cancel: &CancelScope) -> usize {
+    fn push(&mut self, samples: &[f32], _cancel: &CancelScope) -> usize {
         if !self.active {
+            return 0;
+        }
+        // Phase 2: Generation Gate - use internal scope, ignore external param
+        // This ensures old-generation writers cannot write to new-generation output
+        if self.scope.is_cancelled() {
             return 0;
         }
         if samples.is_empty() {
@@ -173,7 +181,8 @@ impl SegmentWriter for RodioSegmentWriter {
             self.start_written = Some(self.inner.playback.begin_write());
         }
 
-        let written = self.inner.ring.push_blocking(samples, cancel);
+        // Use internal scope for ring buffer push
+        let written = self.inner.ring.push_blocking(samples, &self.scope);
         if written == 0 {
             return 0;
         }

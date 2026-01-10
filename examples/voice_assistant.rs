@@ -665,12 +665,23 @@ async fn stream_chat(
             res = cancel.changed() => {
                 if res.is_ok() && *cancel.borrow() {
                     cancelled = true;
+                    // P0.4 fix: Drop stream immediately to release connection resources.
+                    // This helps avoid blocking the next turn's TTFA due to lingering
+                    // SSE data in the connection pool. The drop may trigger TCP RST
+                    // depending on the HTTP client implementation.
+                    drop(stream);
                     break;
                 }
             }
             maybe_chunk = stream.next() => {
                 match maybe_chunk {
                     Some(Ok(response)) => {
+                        // Check cancel signal before processing to avoid unnecessary work
+                        if *cancel.borrow() {
+                            cancelled = true;
+                            drop(stream);
+                            break;
+                        }
                         for choice in response.choices {
                             if let Some(content) = choice.delta.content {
                                 text.push_str(&content);
@@ -704,17 +715,25 @@ async fn stream_chat(
 
 #[cfg(all(feature = "asr-sherpa", feature = "asr-mic"))]
 fn trim_history(messages: &mut Vec<ChatCompletionRequestMessage>, max_messages: usize) {
+    // max_messages == 0 means no limit
     if max_messages == 0 {
         return;
     }
+    // Already within limit
     if messages.len() <= max_messages {
         return;
     }
+    // Only system message or empty - nothing to trim
     if messages.len() <= 1 {
         return;
     }
-    let keep = max_messages.saturating_sub(1).max(1);
-    let extra = messages.len().saturating_sub(1).saturating_sub(keep);
+    // Calculate how many non-system messages to keep
+    // max_messages includes system, so non-system = max_messages - 1 (if system exists)
+    // When max_messages=1, keep = 0 (only system)
+    // When max_messages=2, keep = 1 (system + 1 message)
+    let keep = max_messages.saturating_sub(1);
+    let non_system_count = messages.len().saturating_sub(1);
+    let extra = non_system_count.saturating_sub(keep);
     if extra > 0 {
         messages.drain(1..=extra);
     }

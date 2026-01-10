@@ -675,7 +675,8 @@ impl TtsEngine for GptSovitsTts {
             let inner = &*inner_guard;
 
             let _g = tch::no_grad_guard();
-            let mut segment = AudioStreamSegment::new(audio.as_ref());
+            // Phase 2: scope is cloned and bound to the segment writer at creation
+            let mut segment = AudioStreamSegment::new(audio.as_ref(), cancel_scope.clone());
             run_stream_infer(inner, &text, is_first, &cancel_scope, &mut segment)?;
             let gen_done_ts = Instant::now();
             let (first_audio_ts, playback) = segment.finish(cancel_scope.is_cancelled());
@@ -696,12 +697,15 @@ impl TtsEngine for GptSovitsTts {
     }
 
     async fn stop(&self) -> Result<()> {
-        self.cancel.cancel();
+        self.stop_fast();
+        Ok(())
+    }
 
+    fn stop_fast(&self) {
+        // O(1) fast path: increment epoch + clear ring buffer
+        self.cancel.cancel();
         self.audio.stop();
         self.first_call.store(true, Ordering::Release);
-
-        Ok(())
     }
 
     fn supports_synthesis_queue(&self) -> bool {
@@ -746,7 +750,8 @@ impl TtsEngine for GptSovitsTts {
         let metrics = tokio::task::spawn_blocking(move || {
             let cancel_scope = cancel.scope();
 
-            let mut segment = AudioStreamSegment::new(audio_backend.as_ref());
+            // Phase 2: scope is cloned and bound to the segment writer at creation
+            let mut segment = AudioStreamSegment::new(audio_backend.as_ref(), cancel_scope.clone());
             for chunk in audio.samples.chunks(DEFAULT_PLAY_CHUNK_SAMPLES) {
                 if !segment.push(chunk, &cancel_scope) {
                     break;

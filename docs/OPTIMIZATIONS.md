@@ -64,6 +64,69 @@
 
 ---
 
+### P0.4 LLM 请求取消优化 ✅
+
+**问题**: Barge-in 时 LLM 请求无法中止，占用连接资源，**拖累下一轮 TTFA**。
+
+**解决**: 
+- `stream_chat` 收到 cancel 后**立即 drop stream**
+- 释放 HTTP/2 连接资源
+- 上游 send 立即返回 Err
+
+| 项目 | 内容 |
+|------|------|
+| 代码 | `streaming.rs:SessionCancel`, `llm/mod.rs:stream_chat` |
+| 收益 | O(1) 取消，下一轮 TTFA 不受影响 |
+
+---
+
+### P0.5 VAD ONNX 阻塞 Reactor ✅
+
+**问题**: VAD ONNX 推理 (`vad.accept_waveform()`) 阻塞 tokio reactor。
+
+**解决**: 将 VAD 迁移到 `spawn_blocking` + `std::sync::mpsc` 通道。
+
+| 项目 | 内容 |
+|------|------|
+| 代码 | `sherpa.rs:run_vad_loop`, `sherpa.rs:494-502` |
+| 收益 | reactor 不再被 ONNX 推理阻塞 |
+
+---
+
+### P0.6 代际串台修复 ✅
+
+**问题**: Pipeline 队列中的 Segment 没有携带 generation_id，可能导致旧音频写入新轮次。
+
+**解决**: 
+- `AudioBackend::begin_segment(&self, scope: CancelScope)` trait 改签名
+- `RodioSegmentWriter` 内部绑定 scope
+- `push()` 使用内部 scope 判断，忽略外部参数
+- RMS Gate: `RmsSegmentWriter` 也内部持有 scope
+
+| 项目 | 内容 |
+|------|------|
+| 代码 | `audio/mod.rs`, `audio/rodio.rs` |
+| 收益 | 旧代际的 writer 无法写入新轮次的输出域 |
+
+---
+
+### P3: O(1) 取消语义统一 ✅
+
+**问题**: 取消路径可能 await join，变成"等待退出"而非 O(1)。
+
+**解决**:
+- `SessionCancel` 持有 `AbortHandle` (tokenizer + pipeline)
+- 取消顺序: `stop_fast()` → `abort()` → `signal`
+- 新增 `TtsEngine::stop_fast()` O(1) 同步方法
+- 取消路径不 await join
+
+| 项目 | 内容 |
+|------|------|
+| 代码 | `streaming.rs`, `generator/mod.rs` |
+| 收益 | 取消后 <50ms 资源释放 |
+
+---
+
 ## 待改进项
 
 ### P0.3 VAD 替代能量阈值
@@ -73,59 +136,6 @@
 **现状**: 双门机制使用能量阈值 + 确认窗口。
 
 **建议**: 复用 `SherpaAsrStream` 中的 Silero VAD 状态，替代能量阈值。
-
----
-
-### P0.4 LLM 请求取消
-
-**问题**: Barge-in 时无法中止 LLM 请求，只能关闭 channel 等待超时。
-
-**现状**: 取消后 `StreamSession.shutdown()` 会发送 `cancel_tx.send(true)`，但 LLM 侧仍在产生 delta，占用网络/连接资源。
-
-**影响**: 资源浪费，**拖累下一轮响应的 TTFA**。
-
-**缓解措施**:
-- **应用层**: 收到 cancel 后**立即丢弃**后续 delta，并停止消费 channel (Drain & Drop)。
-- **网络层**: 尝试 Drop response body trigger TCP RST (依赖实现)。
-- **根本解决**: HTTP/2 CANCEL 或 WebSocket close。
-
----
-
-### P0.5 ONNX 推理阻塞 Reactor
-
-**问题**: VAD/Smart Turn ONNX 推理未使用 `spawn_blocking`，高负载时阻塞 tokio reactor。
-
-**代码确认**: VAD 推理在 tokio task 中 (`sherpa.rs:481 tokio::spawn`)，但 `vad.accept_waveform()` 是同步调用。
-
-**影响** (升级为**必须修复**): 
-- 不仅是 P95/P99 抖动
-- **拖慢 delta channel 接收**
-- **影响音频 push 等关键路径**
-
-**建议**: 将 ONNX 推理迁移到 `spawn_blocking` 或专用线程池。
-
----
-
-### P1.1 TTS (ONNX) 推理阻塞 Reactor
-
-**问题**: `gpt-sovits-onnx` 后端同样运行在 tokio task 中，可能导致 reactor starvation。
-**建议**: 同上，迁移至 `spawn_blocking`。
-
----
-
-### P0.6 代际串台 (Generation Leak)
-
-**问题**: `CancelScope` 只在 `push_blocking` 时检查 epoch (`rodio.rs:425`)，但 Pipeline 队列中的 Segment 没有携带 `generation_id`。
-
-**串台场景**:
-1. 用户打断，cancel 发送
-2. TTS 正在合成的句子完成
-3. 新轮次开始
-4. 旧句子音频 push 到新轮次的 RingBuffer
-
-**建议**: 为 LLM delta、TTS segment、PCM frame、RMS 都携带 `generation_id`。
-
-> **修复方向**: 引入 `generation_id`，在 RingBuffer.push() 处做代际过滤，拒绝旧代际的写入。
 
 ---
 
@@ -180,9 +190,9 @@
 
 | 缺陷 | 现状 | 影响 | 短期缓解 |
 |------|------|------|---------|
-| VAD/Turn 阻塞 reactor | 未用 spawn_blocking | **拖慢 delta/音频关键路径** | 无 |
-| 代际串台 | Segment 无 generation_id | 旧音频写入新轮次 | 无 |
-| LLM 请求无法取消 | 关闭 channel | **拖累下一轮 TTFA** | 无 |
+| ~~VAD/Turn 阻塞 reactor~~ | ✅ 已用 spawn_blocking | - | 已解决 |
+| ~~代际串台~~ | ✅ writer 内绑定 scope | - | 已解决 |
+| ~~LLM 请求无法取消~~ | ✅ O(1) abort | - | 已解决 |
 | ASR segment 队列满丢弃 | `try_send` 丢弃新段 | 可能丢识别 | 增大 `ASR_SEGMENT_QUEUE` |
 | first_audio_ts 非播放时间 | 写入端时间戳 | 指标不精确 | +50-70ms 估算 |
 | RingBuffer busy-wait | **Polling + Backoff Sleep** | CPU 争抢 | 改用 crossbeam/condvar |

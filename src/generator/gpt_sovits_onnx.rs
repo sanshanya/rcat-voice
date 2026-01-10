@@ -324,7 +324,8 @@ fn play_chunks(
     audio: &dyn AudioBackend,
     cancel: &CancelScope,
 ) -> (Option<Instant>, Instant, SegmentPlayback) {
-    let mut segment = AudioStreamSegment::new(audio);
+    // Phase 2: scope is cloned and bound to the segment writer at creation
+    let mut segment = AudioStreamSegment::new(audio, cancel.clone());
     for chunk in samples.chunks(chunk_samples) {
         if !segment.push(chunk, cancel) {
             break;
@@ -387,9 +388,14 @@ impl TtsEngine for GptSovitsOnnxTts {
     }
 
     async fn stop(&self) -> Result<()> {
+        self.stop_fast();
+        Ok(())
+    }
+
+    fn stop_fast(&self) {
+        // O(1) fast path: increment epoch + clear ring buffer
         self.cancel.cancel();
         self.audio.stop();
-        Ok(())
     }
 
     fn supports_synthesis_queue(&self) -> bool {

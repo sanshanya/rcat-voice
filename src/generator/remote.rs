@@ -118,7 +118,8 @@ impl RemoteTtsInner {
         let start_ts = Instant::now();
         let cancel_scope = self.cancel.scope();
 
-        let mut segment = AudioStreamSegment::new(self.audio.as_ref());
+        // Phase 2: scope is cloned and bound to the segment writer at creation
+        let mut segment = AudioStreamSegment::new(self.audio.as_ref(), cancel_scope.clone());
 
         let request = crate::remote_tts_protocol::SpeechRequest {
             model: self.model.clone(),
@@ -232,15 +233,15 @@ impl TtsEngine for RemoteTts {
     }
 
     async fn stop(&self) -> Result<()> {
+        self.stop_fast();
+        Ok(())
+    }
+
+    fn stop_fast(&self) {
         #[cfg(feature = "tts-remote")]
         {
             self.inner.cancel.cancel();
             self.inner.audio.stop();
-            Ok(())
-        }
-        #[cfg(not(feature = "tts-remote"))]
-        {
-            Ok(())
         }
     }
 

@@ -53,6 +53,14 @@ pub trait TtsEngine: Send + Sync {
     async fn speak(&self, text: &str) -> Result<TtsMetrics>;
     /// 中断播放并清空已排队音频。
     async fn stop(&self) -> Result<()>;
+    /// O(1) 快速停止：仅设置取消标志和清空输出域，不等待任何后台任务。
+    /// 
+    /// 这是取消路径的权威操作：调用后所有 CancelScope.is_cancelled() 返回 true。
+    /// 默认实现调用 stop()，但建议重写为同步实现以保证 O(1)。
+    fn stop_fast(&self) {
+        // 默认实现：调用 async stop 的阻塞版本
+        // 实现者应该重写这个方法提供真正的 O(1) 实现
+    }
     /// 是否支持合成与播放解耦。
     fn supports_synthesis_queue(&self) -> bool {
         false

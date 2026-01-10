@@ -65,12 +65,19 @@ impl TtsEngine for OsTts {
     }
 
     async fn stop(&self) -> Result<()> {
+        // OS TTS uses async process kill
         let mut guard: tokio::sync::MutexGuard<'_, Option<tokio::process::Child>> =
             self.current_child.lock().await;
         if let Some(mut child) = guard.take() {
             let _ = child.kill().await;
         }
         Ok(())
+    }
+
+    fn stop_fast(&self) {
+        // OS TTS requires async process kill, cannot provide true O(1) stop
+        // The best we can do is nothing - the async stop() will handle it
+        // This is acceptable because OsTts is not used in low-latency paths
     }
 }
 

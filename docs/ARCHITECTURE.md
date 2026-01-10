@@ -29,6 +29,7 @@ rcat-voice 是一个低延迟流式语音对话库，实现 **Mic → ASR → Tu
 pub trait TtsEngine: Send + Sync {
     async fn speak(&self, text: &str) -> Result<TtsMetrics>;  // 合成并播放
     async fn stop(&self) -> Result<()>;                        // 中断播放
+    fn stop_fast(&self);                                        // O(1) 快速停止 (同步)
     fn supports_synthesis_queue(&self) -> bool;                // 是否支持解耦
     async fn synthesize(&self, text: &str) -> Result<Option<SynthesizedAudio>>;
     async fn play_samples(&self, audio: SynthesizedAudio) -> Result<Option<TtsMetrics>>;
@@ -36,11 +37,13 @@ pub trait TtsEngine: Send + Sync {
 }
 ```
 
+> **`stop_fast()`**: O(1) 同步方法，用于取消路径。调用后立即使所有 `CancelScope.is_cancelled()` 返回 true。
+
 #### AudioBackend (音频后端)
 
 ```rust
 pub trait AudioBackend: Send + Sync {
-    fn begin_segment(&self) -> Box<dyn SegmentWriter>;  // 开始写入
+    fn begin_segment(&self, scope: CancelScope) -> Box<dyn SegmentWriter>;  // 开始写入，绑定代际
     fn stop(&self);                                      // 停止播放
     fn sample_rate(&self) -> u32;                        // 采样率
     fn channels(&self) -> u16;                           // 声道数
@@ -54,6 +57,9 @@ pub trait SegmentWriter: Send {
 }
 ```
 
+> **Generation Gate**: `begin_segment` 接受 `CancelScope`，writer 内部绑定此 scope。
+> `push()` 使用内部 scope 判断，忽略外部参数，防止旧代际写入新轮次。
+
 > **注意**: ASR 和 Turn Detection 没有抽象为 Trait，是具体实现 (`SherpaAsrStream`, `SmartTurnDetector`)。
 
 ### 数据类型契约
@@ -63,7 +69,7 @@ pub trait SegmentWriter: Send {
 | `AsrSegment` | `text, finished, idx, start, end, channel`                   | ASR 识别结果，**无置信度、无词级时间戳** |
 | `Segment`    | `text, llm_start_ts, first_token_ts, last_token_ts, sent_ts` | Tokenizer 输出的句子                           |
 | `TtsMetrics` | `start_ts, first_audio_ts, gen_done_ts, play_done_ts`        | TTS 时间指标                                   |
-| `RmsPayload` | `rms, peak, speaking, ts`                                    | 唇形同步遥测                                   |
+| `RmsPayload` | `rms, peak, buffered_ms, speaking, seq`                      | 唇形同步遥测                                   |
 
 ### 音频格式
 
@@ -330,40 +336,54 @@ pub struct CancelScope {
 
 ### 取消权威语义
 
-**唯一的取消与打断权威是 `epoch` (Generation ID)**。
+**唯一的取消与打断权威是 `CancelToken.epoch` (Arc<AtomicU64>)**。
 
 - `CancelToken { epoch }`: 定义了当前活跃的代际。
-- `watch<bool>` (cancel_rx): 仅为**临时实现细节**，用于通知任务这一代已结束。
-- 未来的统一方向: 移除 `watch<bool>`，全链路传递携带 `generation_id` 的事件。
+- `stop_fast()` 调用 `cancel.cancel()` 使 epoch++，立即使所有 CancelScope 失效。
+- `watch<bool>` (cancel_rx): 仅为**兼容层**，用于通知任务这一代已结束。
 
-> **As-Is 当前行为**: Pipeline 同时监听 `interrupt_rx(epoch)` 与 `cancel_rx(bool)`。前者用于代际判定，后者用于唤醒/快速中止的兼容信号。目标是只保留 `epoch`。
+### O(1) 取消路径
+
+```
+stop_fast()  →  epoch++  →  abort(tokenizer)  →  abort(pipeline)  →  signal
+    ↓                              ↓                     ↓
+所有 CancelScope 失效    receiver drop       上游 send 立即 Err
+```
+
+> **关键特性**: O(1) 取消不 await join，立即返回。旧任务自己清理资源。
+
+### Generation Gate
+
+**旧代际的 writer 无法写入新轮次的输出域。**
+
+- `begin_segment(scope: CancelScope)`: writer 创建时绑定代际
+- `push()` 使用内部 scope 判断，忽略外部参数
+- RmsSegmentWriter 也持有 scope，emit 前检查
 
 ### Barge-in 打断流程
 
 1. 检测到连续语音 >= `BARGE_IN_CONFIRM_MS`
 2. 语音持续 >= `BARGE_IN_MIN_SPEECH_MS`
-3. 触发 **Epoch 变更** (`interrupt_tx.send(next_epoch)`)
-   > *注: 当前实现仍兼容使用 `cancel_tx.send(true)`，但逻辑本质是终止当前代际*
-   >
-4. AudioBackend.stop() 清空 RingBuffer
-5. **LLM 请求处理**: 虽无法底层中止连接，但应用层**立即停止消费 delta**并丢弃，防止拖累下一轮。
+3. 调用 `stop_fast()` 使 epoch++ (所有 CancelScope 失效)
+4. abort tokenizer + pipeline (上游 send 立即返回 Err)
+5. AudioBackend.stop() 清空 RingBuffer
 
 ---
 
 ## 线程/任务模型
 
-| 组件       | 执行方式                       | 说明                                              |
-| ---------- | ------------------------------ | ------------------------------------------------- |
-| Mic 捕获   | cpal 回调线程 → mpsc → tokio | 专用线程                                          |
-| VAD 推理   | tokio task                     | **P0 风险**: 阻塞 reactor                   |
-| ASR 推理   | blocking loop                  | 专用线程消费 segment 队列                         |
-| Smart Turn | tokio task                     | **P0 风险**: 阻塞 reactor                   |
-| TTS (CUDA) | `spawn_blocking`             | GPT-SoVITS 在阻塞线程池                           |
-| TTS (ONNX) | tokio task                     | **P1 风险**: 阻塞 reactor (应移至 blocking) |
-| Rodio 播放 | 驱动线程                       | 从 RingBuffer 拉取                                |
+| 组件 | 执行方式 | inflight 约束 | 说明 |
+|----------|---------|--------------|------|
+| Mic 捕获 | cpal 回调线程 → mpsc → tokio | - | 专用线程 |
+| VAD 推理 | `spawn_blocking` + std::sync::mpsc | ✅ inflight=1 | 同步通道保证 |
+| ASR 推理 | blocking loop | ✅ inflight=1 | 专用线程消费 segment 队列 |
+| Smart Turn | tokio task + StdMutex | ✅ inflight=1 | 互斥锁保证 |
+| TTS (CUDA) | `spawn_blocking` | ✅ Semaphore | GPT-SoVITS CUDA |
+| TTS (ONNX) | `spawn_blocking` | ✅ Semaphore | GPT-SoVITS ONNX |
+| TTS Pipeline | tokio task | ✅ synth_inflight=1 | 默认 1 |
+| Rodio 播放 | 驱动线程 | - | 从 RingBuffer 拉取 |
 
-> **风险汇总**: VAD, Smart Turn, TTS(ONNX) 的推理逻辑若运行在 tokio worker 线程，将导致 reactor starvation。
-> **必须修复 (P0/P1)**: 迁移至 `spawn_blocking` 或专用计算线程池。
+> **审计结论**: 所有 compute 组件均满足 inflight=1 约束，无隐式排队风险。
 
 ---
 
@@ -397,17 +417,13 @@ pub struct CancelScope {
 
 ## 已知限制与设计缺陷
 
-| 问题                       | 现状                                   | 影响                                         | 优先级       |
-| -------------------------- | -------------------------------------- | -------------------------------------------- | ------------ |
-| VAD/Turn 阻塞 reactor      | 未用 `spawn_blocking`                | **拖慢 delta channel 接收、音频 push** | **P0** |
-| 代际串台 (generation leak) | Pipeline 队列 Segment 无 generation_id | 取消后旧音频可能写入新轮次                   | **P0** |
-| LLM 请求无法取消           | 只关闭 channel                         | 浪费资源，**拖累下一轮 TTFA**          | P0           |
-| ASR segment 队列满丢弃     | `try_send` 丢弃新段                  | 可能丢识别结果                               | P1           |
-| RMS 采样点                 | 写入端 (非播放端)                      | 唇形有 prefill 提前量 (~50ms)                | P1           |
-
-> **代际串台详细场景**: 用户打断 → cancel 发送 → TTS 正在合成的句子完成 → 新轮次开始 → 旧句子音频 push 到新轮次 RingBuffer
->
-> **修复方向**: 为 Pipeline 队列元素 (Segment) 与音频写入路径 (PCM Frame) 引入 `generation_id`，在 RingBuffer 写入侧做代际过滤/拒绝。
+| 问题 | 现状 | 影响 | 优先级 |
+|------|------|------|--------|
+| ~~VAD/Turn 阻塞 reactor~~ | ✅ 已用 spawn_blocking | - | 已解决 |
+| ~~代际串台~~ | ✅ writer 内绑定 scope | - | 已解决 |
+| ~~LLM 请求无法取消~~ | ✅ O(1) abort | - | 已解决 |
+| ASR segment 队列满丢弃 | `try_send` 丢弃新段 | 可能丢识别结果 | P1 |
+| RMS 采样点 | 写入端 (非播放端) | 唇形有 prefill 提前量 (~50ms) | P1 |
 
 ---
 
