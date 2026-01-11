@@ -100,6 +100,52 @@ cargo run --example voice_assistant --features asr-sherpa,asr-mic,turn-smart --r
 
 ---
 
+## 🎙️ 说话人识别与分离
+
+提供两个独立示例用于说话人相关功能：
+
+### 模型下载
+
+```bash
+# 说话人 Embedding 模型 (3dspeaker, 推荐)
+wget https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx
+
+# 分段模型 (pyannote segmentation, 用于 diarization)
+wget https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2
+tar xvf sherpa-onnx-pyannote-segmentation-3-0.tar.bz2
+# 使用 model.int8.onnx 在 CPU 上更快
+```
+
+### Example 1: Speaker ID Gate (说话人验证)
+
+适用于"只响应主人"场景，作为 ASR 前置 gate：
+
+```bash
+cargo run --example speaker_id_gate --features asr-sherpa -- \
+    --model 3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx \
+    --enroll owner1.wav --enroll owner2.wav \
+    --test unknown.wav \
+    --threshold 0.5
+```
+
+> **低延迟集成**: 在 VAD/turn-end 切出的 utterance 上运行一次 embedding（约10-50ms），与预存 voiceprint 对比，低于阈值则丢弃，不进入 ASR/LLM。
+
+### Example 2: Diarize Offline (离线说话人分离)
+
+输出"谁在什么时候说话"：
+
+```bash
+cargo run --example diarize_offline --features asr-sherpa -- \
+    --seg-model sherpa-onnx-pyannote-segmentation-3-0/model.onnx \
+    --emb-model 3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx \
+    --audio meeting.wav \
+    --json
+```
+
+> **在线近似**: 对于实时场景，建议使用 utterance-level speaker labeling：VAD → embedding → `EmbeddingManager.search()` 归类/更新 speaker 原型。
+
+---
+
 ## Cargo Features
 
 | Feature             | 功能                | 依赖           |
