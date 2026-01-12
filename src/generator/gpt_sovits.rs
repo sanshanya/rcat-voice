@@ -776,6 +776,10 @@ impl TtsEngine for GptSovitsTts {
     fn buffered_ms(&self) -> Option<u64> {
         self.audio.buffered_ms()
     }
+
+    fn cancel_token(&self) -> Option<CancelToken> {
+        Some(self.cancel.clone())
+    }
 }
 
 pub fn build(audio: Arc<dyn AudioBackend>) -> Result<Arc<dyn TtsEngine>> {

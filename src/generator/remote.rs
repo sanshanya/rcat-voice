@@ -1,6 +1,8 @@
 use super::{Result, TtsEngine, TtsMetrics};
-use anyhow::anyhow;
 use async_trait::async_trait;
+
+#[cfg(not(feature = "tts-remote"))]
+use anyhow::anyhow;
 
 #[cfg(feature = "tts-remote")]
 use anyhow::bail;
@@ -249,6 +251,17 @@ impl TtsEngine for RemoteTts {
         #[cfg(feature = "tts-remote")]
         {
             self.inner.audio.buffered_ms()
+        }
+        #[cfg(not(feature = "tts-remote"))]
+        {
+            None
+        }
+    }
+
+    fn cancel_token(&self) -> Option<crate::audio::CancelToken> {
+        #[cfg(feature = "tts-remote")]
+        {
+            Some(self.inner.cancel.clone())
         }
         #[cfg(not(feature = "tts-remote"))]
         {

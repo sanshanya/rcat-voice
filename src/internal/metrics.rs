@@ -1,6 +1,6 @@
 use crate::generator::TtsMetrics;
-use crate::tokenizer::Segment;
 use crate::internal::env;
+use crate::tokenizer::Segment;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::time::Duration;
@@ -99,10 +99,7 @@ pub(crate) async fn await_playback_drain(
     last_play_done_ts: &Arc<StdMutex<Option<tokio::time::Instant>>>,
 ) {
     while play_done_tasks.join_next().await.is_some() {}
-    let done_ts = last_play_done_ts
-        .lock()
-        .map(|guard| *guard)
-        .unwrap_or(None);
+    let done_ts = last_play_done_ts.lock().map(|guard| *guard).unwrap_or(None);
     let Some(done_ts) = done_ts else {
         return;
     };

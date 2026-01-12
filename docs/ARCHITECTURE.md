@@ -53,23 +53,31 @@ pub trait AudioBackend: Send + Sync {
 pub trait SegmentWriter: Send {
     fn push(&mut self, samples: &[f32], cancel: &CancelScope) -> usize;
     fn finish(self: Box<Self>, cancelled: bool) -> SegmentPlayback;
-    fn first_audio_ts(&self) -> Option<Instant>;
+    fn first_audio_ts(&self) -> Option<Instant>;  // play-domain 估算
 }
 ```
 
 > **Generation Gate**: `begin_segment` 接受 `CancelScope`，writer 内部绑定此 scope。
 > `push()` 使用内部 scope 判断，忽略外部参数，防止旧代际写入新轮次。
 
-> **注意**: ASR 和 Turn Detection 没有抽象为 Trait，是具体实现 (`SherpaAsrStream`, `SmartTurnDetector`)。
+> **注意**: ASR 仍是具体实现 (`SherpaAsrStream`)；Turn Detection 已抽象为 `TurnBoundaryDetector` trait，
+> 提供 `VadGateTurnDetector` / `SmartTurnBoundaryDetector` 等实现。
 
 ### 数据类型契约
 
 | 类型           | 字段                                                           | 说明                                           |
 | -------------- | -------------------------------------------------------------- | ---------------------------------------------- |
 | `AsrSegment` | `text, finished, idx, start, end, channel`                   | ASR 识别结果，**无置信度、无词级时间戳** |
+| `VadEvent`   | `SpeechStart { ts }, SpeechEnd { ts, duration_ms }`          | VAD 边沿事件 (ts = 检测时刻)                   |
+| `VadState`   | `speaking, last_change_ts, seq`                              | VAD 状态快照 (用于状态查询/静音累计)           |
+| `TurnEvent`  | `kind: TurnEventKind, ts: Instant`                           | 端点检测事件 (SpeechStart/End/Committed)       |
+| `AudioFrameRef` | `samples: &[i16], sample_rate, channels, ts`              | 音频帧引用 (零拷贝输入)                        |
+| `TurnDetectorConfig` | `min_silence_ms, commit_ms, force_end_ms, ...`       | 端点检测配置                                   |
+| `TurnContext` | `turn_id, epoch_snapshot, created_at`                      | Turn 快照（绑定事件/指标 + 取消快照）          |
 | `Segment`    | `text, llm_start_ts, first_token_ts, last_token_ts, sent_ts` | Tokenizer 输出的句子                           |
 | `TtsMetrics` | `start_ts, first_audio_ts, gen_done_ts, play_done_ts`        | TTS 时间指标                                   |
 | `RmsPayload` | `rms, peak, buffered_ms, speaking, seq`                      | 唇形同步遥测                                   |
+| `SegmentPlayback` | `first_audio_ts, play_done_ts, play_done_rx` | 片段播放时间信息                            |
 
 ### 音频格式
 
@@ -94,8 +102,6 @@ flowchart LR
         S["vad_segment_tx/rx (音频分段)<br/>mpsc<VadSegment><br/>容量: 8"]
         A["out_tx/rx<br/>mpsc<AsrSegment><br/>容量: 64"]
         R["rms_tx<br/>mpsc::Unbounded"]
-        CA["cancel_rx<br/>watch<bool>"]
-        IN["interrupt_rx<br/>watch<u64> (epoch)"]
     end
 ```
 
@@ -340,12 +346,21 @@ pub struct CancelScope {
 
 - `CancelToken { epoch }`: 定义了当前活跃的代际。
 - `stop_fast()` 调用 `cancel.cancel()` 使 epoch++，立即使所有 CancelScope 失效。
-- `watch<bool>` (cancel_rx): 仅为**兼容层**，用于通知任务这一代已结束。
+- StreamSession 的取消/打断通过 `stop_fast()` + abort task 实现；不再依赖 `watch` 信号。
+
+### TurnContext / TurnManager
+
+TurnContext 用于为“单轮对话”绑定 `turn_id`，并携带取消权威快照 `epoch_snapshot`：
+
+- `TurnManager::current_context()`：只读快照（用于绑定事件/指标）
+- `TurnManager::advance_turn()`：`epoch++` + `turn_id++`（进入新轮次）
+- `TurnManager::advance_turn_no_cancel()`：仅 `turn_id++`（epoch 已由 `stop_fast()` 推进时使用）
+- `CancelScope::from(&TurnContext)`：将 turn 取消快照适配为 `CancelScope`（用于 generation gate）
 
 ### O(1) 取消路径
 
 ```
-stop_fast()  →  epoch++  →  abort(tokenizer)  →  abort(pipeline)  →  signal
+stop_fast()  →  epoch++  →  abort(tokenizer)  →  abort(pipeline)
     ↓                              ↓                     ↓
 所有 CancelScope 失效    receiver drop       上游 send 立即 Err
 ```

@@ -77,6 +77,14 @@ pub trait TtsEngine: Send + Sync {
     fn buffered_ms(&self) -> Option<u64> {
         None
     }
+
+    /// 返回该引擎使用的取消权威 (`CancelToken`)。
+    ///
+    /// 用途：将 TurnContext/TurnManager 与 TTS 的 epoch 绑定到同一来源，
+    /// 以便 `CancelScope` 与 turn_id/epoch 语义一致。
+    fn cancel_token(&self) -> Option<crate::audio::CancelToken> {
+        None
+    }
 }
 
 /// TTS backend selection for the builder API.

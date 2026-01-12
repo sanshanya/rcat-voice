@@ -8,7 +8,7 @@ use crate::internal::env;
 
 /// 单个音频片段的播放时间信息。
 pub struct SegmentPlayback {
-    /// 首个音频样本时间戳（流式时可用）。
+    /// 首个音频样本时间戳（流式时可用，play-domain 估算）。
     pub first_audio_ts: Option<Instant>,
     /// 播放完成时间戳。
     pub play_done_ts: Instant,
@@ -40,6 +40,10 @@ impl CancelToken {
         }
     }
 
+    pub fn current_epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Acquire)
+    }
+
     pub fn cancel(&self) {
         let _ = self.epoch.fetch_add(1, Ordering::AcqRel);
     }
@@ -47,6 +51,13 @@ impl CancelToken {
     pub fn scope(&self) -> CancelScope {
         CancelScope {
             epoch: self.epoch.load(Ordering::Acquire),
+            token: self.epoch.clone(),
+        }
+    }
+
+    pub fn scope_at(&self, epoch: u64) -> CancelScope {
+        CancelScope {
+            epoch,
             token: self.epoch.clone(),
         }
     }
@@ -71,7 +82,7 @@ pub trait SegmentWriter: Send {
     fn push(&mut self, samples: &[f32], cancel: &CancelScope) -> usize;
     /// 结束片段并返回播放时间信息。
     fn finish(self: Box<Self>, cancelled: bool) -> SegmentPlayback;
-    /// 首个音频样本时间戳（若可用）。
+    /// 首个音频样本时间戳（play-domain 估算，若可用）。
     fn first_audio_ts(&self) -> Option<Instant>;
 }
 
@@ -166,7 +177,7 @@ impl AudioBackend for RmsAudioBackend {
             inner: self.inner.begin_segment(scope.clone()),
             audio: Arc::clone(&self.inner),
             rms_tx: self.rms_tx.clone(),
-            scope,  // Phase 2: bind scope for RMS gate
+            scope, // Phase 2: bind scope for RMS gate
             seq: 0,
         })
     }
@@ -292,7 +303,7 @@ impl AudioStreamSegment {
 /// 流式播放的音频后端抽象。
 pub trait AudioBackend: Send + Sync {
     /// 开始一个新的片段写入，绑定代际权威。
-    /// 
+    ///
     /// Phase 2: scope 在 writer 创建时绑定，写入时使用内部 scope 判断，
     /// 不依赖外部参数。这确保了旧代际的 writer 无法写入新轮次的输出域。
     fn begin_segment(&self, scope: CancelScope) -> Box<dyn SegmentWriter>;

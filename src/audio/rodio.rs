@@ -128,7 +128,7 @@ impl AudioBackend for RodioBackend {
         Box::new(RodioSegmentWriter {
             inner: Arc::clone(&self.inner),
             active,
-            scope,  // Phase 2: bind scope at creation
+            scope, // Phase 2: bind scope at creation
             start_written: None,
             written_total: 0,
             first_audio_ts: None,

@@ -33,6 +33,7 @@ gpt_sovits_onnx_rs = { package = "gpt-sovits-onnx-rs", git = "https://github.com
 # Optional: ASR (Sherpa-ONNX via sherpa-rs)
 # Vendored so we can track newer sherpa-onnx C-API for newer models (e.g. FunASR-Nano).
 sherpa-rs = { path = "vendor/sherpa-rs/sherpa-rs", default-features = false, features = ["download-binaries"], optional = true }
+smallvec = "1.15.1"
 
 [features]
 default = []

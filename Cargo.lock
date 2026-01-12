@@ -3174,6 +3174,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sherpa-rs",
+ "smallvec 1.15.1",
  "smart-turn-rs",
  "tokio",
  "tracing",
