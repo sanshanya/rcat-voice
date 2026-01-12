@@ -9,8 +9,10 @@ use async_openai::{
 };
 use futures::StreamExt;
 use rcat_voice::generator;
-use rcat_voice::streaming::StreamSession;
+use rcat_voice::metrics::{MetricsSink, TracingMetricsSink};
+use rcat_voice::streaming::StreamSessionBuilder;
 use serde_json::Value;
+use std::sync::Arc;
 use tokio::sync::{mpsc, watch};
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
@@ -27,7 +29,12 @@ async fn main() -> Result<()> {
     let model = std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "deepseek-chat".to_string());
 
     let tts_engine = generator::build_from_env()?;
-    let session = StreamSession::from_env(tts_engine);
+    let metrics: Arc<dyn MetricsSink> = Arc::new(TracingMetricsSink::from_env());
+    let turn_id = 1;
+    let session = StreamSessionBuilder::from_env(tts_engine)
+        .turn_id(turn_id)
+        .metrics_sink(metrics)
+        .build();
     let control = session.control();
     control.mark_llm_start();
 
@@ -45,12 +52,7 @@ async fn main() -> Result<()> {
 
     let delta_tx = control.sender();
     let sse_handle = tokio::spawn(sse_stream_chat(
-        base_url,
-        api_key,
-        model,
-        messages,
-        delta_tx,
-        cancel_rx,
+        base_url, api_key, model, messages, delta_tx, cancel_rx,
     ));
 
     if let Err(e) = sse_handle.await? {

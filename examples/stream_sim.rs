@@ -1,6 +1,8 @@
 use anyhow::Result;
 use rcat_voice::generator;
-use rcat_voice::streaming::StreamSession;
+use rcat_voice::metrics::{MetricsSink, TracingMetricsSink};
+use rcat_voice::streaming::StreamSessionBuilder;
+use std::sync::Arc;
 use tokio::time::{Duration, sleep};
 use tracing_subscriber::EnvFilter;
 
@@ -10,7 +12,12 @@ async fn main() -> Result<()> {
     let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
 
     let tts_engine = generator::build_from_env()?;
-    let session = StreamSession::from_env(tts_engine);
+    let metrics: Arc<dyn MetricsSink> = Arc::new(TracingMetricsSink::from_env());
+    let turn_id = 1;
+    let session = StreamSessionBuilder::from_env(tts_engine)
+        .turn_id(turn_id)
+        .metrics_sink(metrics)
+        .build();
     let control = session.control();
     control.mark_llm_start();
 
@@ -27,7 +34,6 @@ async fn main() -> Result<()> {
             sleep(Duration::from_millis(80)).await;
         }
     });
-
 
     let _ = send_task.await;
     drop(sender);

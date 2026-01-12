@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use crate::asr::utils::{LinearResampler, pcm_i16_to_mono_f32};
-use crate::internal::env;
+use crate::internal::{env, models, ort_log};
 
 const WINDOW_SECONDS: usize = 8;
 
@@ -18,8 +18,9 @@ impl SmartTurnConfig {
     pub fn from_env() -> Result<Self> {
         let model = env::string("SMART_TURN_MODEL")
             .map(PathBuf::from)
+            .or_else(models::turn_dir)
             .context(
-                "SMART_TURN_MODEL is required (path to smart-turn-v3*.onnx, or a directory containing it)",
+                "SMART_TURN_MODEL is required (path to smart-turn-v3*.onnx, a directory containing it, or set RCAT_MODELS_DIR)",
             )?;
         let model = resolve_smart_turn_model_path(model)?;
         let threshold = env::f32_clamped("SMART_TURN_THRESHOLD", 0.5, 0.0, 1.0);
@@ -40,6 +41,8 @@ pub struct SmartTurnModel {
 
 impl SmartTurnModel {
     pub fn new(model: impl AsRef<Path>) -> Result<Self> {
+        ort_log::apply_from_env();
+
         let model = model.as_ref();
         if !model.exists() {
             bail!("SMART_TURN_MODEL not found: {}", model.display());
@@ -264,9 +267,12 @@ impl SmartTurnDetector {
 
 /// Convenience: load a Smart Turn model from the default env var and return the resolved path.
 pub fn model_path_from_env() -> Result<PathBuf> {
-    let model = env::string("SMART_TURN_MODEL").map(PathBuf::from).context(
-        "SMART_TURN_MODEL is required (path to smart-turn-v3*.onnx, or a directory containing it)",
-    )?;
+    let model = env::string("SMART_TURN_MODEL")
+        .map(PathBuf::from)
+        .or_else(models::turn_dir)
+        .context(
+            "SMART_TURN_MODEL is required (path to smart-turn-v3*.onnx, a directory containing it, or set RCAT_MODELS_DIR)",
+        )?;
     resolve_smart_turn_model_path(model)
 }
 

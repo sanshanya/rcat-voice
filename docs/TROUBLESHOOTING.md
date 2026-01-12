@@ -30,7 +30,7 @@
 **进程隔离示例:**
 ```powershell
 # 终端 1: 启动 Worker
-$env:GSV_MODEL_DIR = "v2pro"
+$env:RCAT_MODELS_DIR = "F:\\github\\rcat\\models"
 cargo run --bin tts_worker --features tts-worker --release
 
 # 终端 2: 主应用
@@ -198,6 +198,7 @@ SMART_TURN_MODEL not found: path/to/model.onnx
 1. 确认路径存在
 2. Windows 使用反斜杠或正斜杠都可以
 3. 可以指定目录，自动查找 `smart-turn*.onnx`
+4. 推荐仅设置 `RCAT_MODELS_DIR=/path/to/models`，并按 `models/TURN/` 放置 smart-turn 模型（可配合 `SMART_TURN_VARIANT=cpu|gpu` 选择）
 
 ---
 
@@ -207,16 +208,21 @@ SMART_TURN_MODEL not found: path/to/model.onnx
 |------|------|
 | `RUST_LOG=rcat_voice=debug` | 本项目 debug 日志 |
 | `RUST_LOG=gpt_sovits_rs=debug` | GPT-SoVITS 上游库 |
+| `ORT_LOG=warning` | ONNX Runtime 日志级别（默认 warning；设为 info/verbose 会很吵） |
 | `AUDIO_RING_METRICS=1` | Ring Buffer 阻塞指标 |
-| `VOICE_TTS_METRICS=1` | TTS 时间线指标 |
+| `VOICE_STREAM_METRICS=1` | LLM/TTS 推导指标（TracingMetricsSink） |
+| `VOICE_TTS_METRICS=1` | TTS/流式推导指标（TracingMetricsSink） |
+| `STREAM_METRICS=1` | 兼容旧开关（等价于启用 TracingMetricsSink） |
 | `ASR_INFER_LOG=1` | ASR 推理耗时 |
+| `VOICE_METRICS_MAX_TURNS=1024` | 限制 TracingMetricsSink 的 turn 状态数量 |
 | `TOKENIZER_RELAX_LOG=1` | 分句 Relax 状态 |
 
 ---
+
+> 启用 `VOICE_STREAM_METRICS=1`/`VOICE_TTS_METRICS=1` 后，默认会输出 `tts_ttfa_ms`（音频生成延迟：首段送入 TTS→首音）与 `e2e_ttfa_ms`（端到端延迟：用户说完→首音）。
 
 ## 相关文档
 
 - [README.md](./README.md) - 文档索引
 - [ARCHITECTURE.md](./ARCHITECTURE.md) - 系统架构
 - [FEATURE_MAP.md](./FEATURE_MAP.md) - 功能-代码映射
-- [OPTIMIZATIONS.md](./OPTIMIZATIONS.md) - 优化建议

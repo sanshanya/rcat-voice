@@ -126,6 +126,7 @@ pub enum MetricEventKind {
     TurnEnd,
     LlmStart,  // 补齐基准点
     LlmFirstToken,
+    TtsFirstSegmentSent,
     TtsFirstAudio,
     AsrInference { infer_ms: u64 },
 }

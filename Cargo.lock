@@ -3168,6 +3168,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "jieba-rs 0.8.1",
+ "ort",
  "rand_core 0.10.0-rc-2",
  "reqwest",
  "rodio",

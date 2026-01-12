@@ -15,7 +15,8 @@ use futures::StreamExt;
 #[cfg(all(feature = "asr-sherpa", feature = "asr-mic"))]
 use rcat_voice::{
     generator,
-    streaming::{StreamCancelHandle, StreamSession},
+    metrics::{MetricEvent, MetricEventKind, MetricsSink, TracingMetricsSink},
+    streaming::{StreamCancelHandle, StreamSessionBuilder},
 };
 #[cfg(all(feature = "asr-sherpa", feature = "asr-mic"))]
 use std::io::{self, Write};
@@ -26,12 +27,12 @@ use tokio::sync::{mpsc, watch};
 #[cfg(all(feature = "asr-sherpa", feature = "asr-mic"))]
 use tokio::task::JoinHandle;
 
+#[cfg(all(feature = "asr-sherpa", feature = "asr-mic", feature = "turn-smart"))]
+use rcat_voice::turn::SmartTurnBoundaryDetector;
 #[cfg(all(feature = "asr-sherpa", feature = "asr-mic"))]
 use rcat_voice::turn::{
     AudioFrameRef, TurnBoundaryDetector, TurnEvent, TurnEventKind, VadGateTurnDetector,
 };
-#[cfg(all(feature = "asr-sherpa", feature = "asr-mic", feature = "turn-smart"))]
-use rcat_voice::turn::SmartTurnBoundaryDetector;
 #[cfg(all(feature = "asr-sherpa", feature = "asr-mic"))]
 use smallvec::SmallVec;
 
@@ -202,8 +203,9 @@ async fn main() -> Result<()> {
     );
     info!("voice_assistant: press Ctrl+C to stop");
 
+    let metrics: Arc<dyn MetricsSink> = Arc::new(TracingMetricsSink::from_env());
     let tts_engine = generator::build_from_env()?;
-    let mut asr = rcat_voice::asr::SherpaAsrStream::from_env()?;
+    let mut asr = rcat_voice::asr::SherpaAsrStream::from_env_with_metrics(metrics.clone())?;
 
     let barge_in_min_speech_ms = std::env::var("BARGE_IN_MIN_SPEECH_MS")
         .ok()
@@ -223,22 +225,39 @@ async fn main() -> Result<()> {
     let mut turn_detector = {
         #[cfg(feature = "turn-smart")]
         {
-            match std::env::var("SMART_TURN_MODEL") {
-                Ok(value) if !value.trim().is_empty() => {
-                    let detector = SmartTurnBoundaryDetector::from_env()?;
-                    let cfg = detector.config();
-                    info!(
-                        "voice_assistant: smart_turn enabled (threshold={:.2}, model={})",
-                        detector.inner().threshold(),
-                        value
-                    );
-                    info!(
-                        "voice_assistant: turn gate: min_silence_ms={} commit_ms={} force_end_ms={} eval_interval_ms={}",
-                        cfg.min_silence_ms, cfg.commit_ms, cfg.force_end_ms, cfg.eval_interval_ms
-                    );
-                    TurnDetector::Smart(detector)
+            let env_has = |key: &str| std::env::var(key).ok().is_some_and(|v| !v.trim().is_empty());
+            let smart_turn_disabled = std::env::var("SMART_TURN_DISABLE").ok().is_some_and(|v| {
+                matches!(
+                    v.trim().to_lowercase().as_str(),
+                    "1" | "true" | "yes" | "y" | "on"
+                )
+            });
+            let smart_turn_enabled =
+                !smart_turn_disabled && (env_has("SMART_TURN_MODEL") || env_has("RCAT_MODELS_DIR"));
+            if smart_turn_enabled {
+                match SmartTurnBoundaryDetector::from_env() {
+                    Ok(detector) => {
+                        let cfg = detector.config();
+                        info!(
+                            "voice_assistant: smart_turn enabled (threshold={:.2})",
+                            detector.inner().threshold()
+                        );
+                        info!(
+                            "voice_assistant: turn gate: min_silence_ms={} commit_ms={} force_end_ms={} eval_interval_ms={}",
+                            cfg.min_silence_ms,
+                            cfg.commit_ms,
+                            cfg.force_end_ms,
+                            cfg.eval_interval_ms
+                        );
+                        TurnDetector::Smart(detector)
+                    }
+                    Err(err) => {
+                        warn!("voice_assistant: smart_turn disabled: {err}");
+                        TurnDetector::Vad(VadGateTurnDetector::from_env())
+                    }
                 }
-                _ => TurnDetector::Vad(VadGateTurnDetector::from_env()),
+            } else {
+                TurnDetector::Vad(VadGateTurnDetector::from_env())
             }
         }
         #[cfg(not(feature = "turn-smart"))]
@@ -278,6 +297,7 @@ async fn main() -> Result<()> {
     trim_history(&mut messages, history_max_messages);
 
     let mut assistant: Option<RunningAssistant> = None;
+    let mut turn_id: u64 = 1;
 
     let mut turn_text = String::new();
     let mut barge_in_speech_start_ts: Option<Instant> = None;
@@ -434,13 +454,22 @@ async fn main() -> Result<()> {
                         ));
                         trim_history(&mut messages, history_max_messages);
                         println!("USER: {user_text}");
+                        let this_turn_id = turn_id;
+                        turn_id = turn_id.wrapping_add(1);
+                        metrics.on_event(MetricEvent {
+                            turn_id: this_turn_id,
+                            kind: MetricEventKind::TurnEnd,
+                            ts: now,
+                        });
                         assistant = Some(
                             start_assistant(
                                 tts_engine.clone(),
+                                metrics.clone(),
+                                this_turn_id,
                                 llm_client.clone(),
                                 model.clone(),
                                 messages.clone(),
-                                std::time::Instant::now(),
+                                now,
                             )
                             .await?,
                         );
@@ -462,7 +491,7 @@ async fn main() -> Result<()> {
 struct LlmResult {
     text: String,
     cancelled: bool,
-    turn_end_ts: std::time::Instant,
+    turn_end_ts: tokio::time::Instant,
 }
 
 #[cfg(all(feature = "asr-sherpa", feature = "asr-mic"))]
@@ -487,12 +516,17 @@ async fn stop_running(mut running: RunningAssistant) -> Result<()> {
 #[cfg(all(feature = "asr-sherpa", feature = "asr-mic"))]
 async fn start_assistant(
     tts_engine: Arc<dyn rcat_voice::generator::TtsEngine>,
+    metrics: Arc<dyn MetricsSink>,
+    turn_id: u64,
     client: Arc<Client<OpenAIConfig>>,
     model: Arc<String>,
     messages: Vec<ChatCompletionRequestMessage>,
-    turn_end_ts: std::time::Instant,
+    turn_end_ts: tokio::time::Instant,
 ) -> Result<RunningAssistant> {
-    let session = StreamSession::from_env(tts_engine);
+    let session = StreamSessionBuilder::from_env(tts_engine)
+        .turn_id(turn_id)
+        .metrics_sink(metrics)
+        .build();
     let cancel_handle = session.cancel_handle();
     let control = session.control();
     control.mark_llm_start();
@@ -527,7 +561,7 @@ async fn stream_chat(
     messages: Vec<ChatCompletionRequestMessage>,
     delta_tx: mpsc::Sender<String>,
     mut cancel: watch::Receiver<bool>,
-    turn_end_ts: std::time::Instant,
+    turn_end_ts: tokio::time::Instant,
 ) -> Result<LlmResult> {
     let request = CreateChatCompletionRequestArgs::default()
         .model((*model).clone())
@@ -722,4 +756,3 @@ fn build_cpal_stream(
         other => bail!("Unsupported input sample format: {other:?}"),
     }
 }
-

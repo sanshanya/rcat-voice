@@ -6,7 +6,7 @@ rcat-voice 是一个低延迟流式语音对话库，实现 **Mic → ASR → Tu
 
 ### 设计目标
 
-1. **低延迟**: 最小化用户说完到听到回复的时间 (E2E_TTFA)
+1. **低延迟**: 最小化端到端延迟（用户说完→首音，E2E_TTFA）
 2. **流式处理**: 全链路流式，不等待完整结果
 3. **可扩展**: 通过 Trait 抽象支持多种后端
 4. **易集成**: 通过环境变量配置，无需重新编译
@@ -63,6 +63,35 @@ pub trait SegmentWriter: Send {
 > **注意**: ASR 仍是具体实现 (`SherpaAsrStream`)；Turn Detection 已抽象为 `TurnBoundaryDetector` trait，
 > 提供 `VadGateTurnDetector` / `SmartTurnBoundaryDetector` 等实现。
 
+#### MetricsSink (指标接收器)
+
+`MetricsSink` 用于接收来自各组件的 **原子指标事件**（绑定 `turn_id`），用于统一埋点与下游可观测性（日志/遥测/统计）。
+
+```rust
+pub trait MetricsSink: Send + Sync {
+    fn on_event(&self, event: MetricEvent);
+}
+
+pub struct MetricEvent {
+    pub turn_id: u64,
+    pub kind: MetricEventKind,
+    pub ts: Instant,
+}
+
+pub enum MetricEventKind {
+    TurnEnd,
+    LlmStart,
+    LlmFirstToken,
+    TtsFirstSegmentSent,
+    TtsFirstAudio,
+    AsrInference { infer_ms: u64 },
+}
+```
+
+> **LlmStart 是关键基准点**：用于将后续 LLM/TTS 指标对齐到同一个起点。
+> `TurnEnd` 通常由编排器（Turn Gate）在端点确认时上报，用于计算 **端到端延迟** (`E2E_TTFA`)。
+> `TtsFirstSegmentSent` 用于计算 **音频生成延迟** (`TTS_TTFA`)。
+
 ### 数据类型契约
 
 | 类型           | 字段                                                           | 说明                                           |
@@ -74,7 +103,8 @@ pub trait SegmentWriter: Send {
 | `AudioFrameRef` | `samples: &[i16], sample_rate, channels, ts`              | 音频帧引用 (零拷贝输入)                        |
 | `TurnDetectorConfig` | `min_silence_ms, commit_ms, force_end_ms, ...`       | 端点检测配置                                   |
 | `TurnContext` | `turn_id, epoch_snapshot, created_at`                      | Turn 快照（绑定事件/指标 + 取消快照）          |
-| `Segment`    | `text, llm_start_ts, first_token_ts, last_token_ts, sent_ts` | Tokenizer 输出的句子                           |
+| `Segment`    | `turn_id, text, llm_start_ts, first_token_ts, last_token_ts, segment_sent_ts` | Tokenizer 输出的句子                           |
+| `MetricEvent` | `turn_id, kind, ts`                                         | 原子指标事件（用于 MetricsSink）               |
 | `TtsMetrics` | `start_ts, first_audio_ts, gen_done_ts, play_done_ts`        | TTS 时间指标                                   |
 | `RmsPayload` | `rms, peak, buffered_ms, speaking, seq`                      | 唇形同步遥测                                   |
 | `SegmentPlayback` | `first_audio_ts, play_done_ts, play_done_rx` | 片段播放时间信息                            |
@@ -115,14 +145,14 @@ flowchart LR
 | Channel                   | 满时策略                          | 代码位置             |
 | ------------------------- | --------------------------------- | -------------------- |
 | `delta_tx`              | 阻塞发送端 (背压)                 | `streaming.rs:242` |
-| `segment_tx` (VAD→ASR) | **丢弃新段** (`try_send`) | `sherpa.rs:666`    |
+| `segment_tx` (VAD→ASR) | 阻塞发送端 (spawn_blocking 背压) | `src/asr/sherpa.rs` |
 | RingBuffer                | Polling + Backoff Sleep           | `rodio.rs:435`     |
 
 > **RingBuffer 策略**:
 > 采用 "Polling with exponential backoff sleep" (100-800us)。
 > 风险: 短睡眠精度受 OS 调度影响，可能导致 CPU 争抢或抖动。未来应替换为 `Condvar` 或 `crossbeam`。
 
-> **设计与实现差异**: ASR segment 队列满时丢弃新段可能导致识别结果丢失，但避免了内存无限增长。
+> **ASR segment 队列策略**: 使用有界队列 + `blocking_send`，不会丢段；队列满时会阻塞 VAD 线程（spawn_blocking），形成背压并避免内存无限增长。
 
 > **上游影响**: `delta_tx` 满时阻塞等价于 "LLM delta 读取链路阻塞"，背压将传回 LLM 响应读取处（可能导致上游缓冲增加）。因此必须配合"取消后立即停止消费 delta"的策略才能闭环。
 
@@ -310,8 +340,8 @@ gantt
 | 指标               | 全称                | 定义                                             | 典型目标 |
 | ------------------ | ------------------- | ------------------------------------------------ | -------- |
 | **LLM_TTFT** | Time To First Token | `mark_llm_start()` → 首个**非空 delta** 到达 | < 400ms  |
-| **TTS_TTFA** | TTS 首音频可播时延  | `TtsMetrics.start_ts` → `first_audio_ts`     | < 300ms  |
-| **E2E_TTFA** | End-to-End TTFA     | `turn_end` → `first_audio_ts`                | < 800ms  |
+| **TTS_TTFA** | 音频生成延迟 | `TtsFirstSegmentSent` → `TtsFirstAudio`（首段送入 TTS→首音） | < 300ms  |
+| **E2E_TTFA** | 端到端延迟 | `TurnEnd` → `TtsFirstAudio`（用户说完→首音） | < 800ms  |
 
 > **`first_audio_ts` 语义**:
 >
@@ -437,7 +467,7 @@ stop_fast()  →  epoch++  →  abort(tokenizer)  →  abort(pipeline)
 | ~~VAD/Turn 阻塞 reactor~~ | ✅ 已用 spawn_blocking | - | 已解决 |
 | ~~代际串台~~ | ✅ writer 内绑定 scope | - | 已解决 |
 | ~~LLM 请求无法取消~~ | ✅ O(1) abort | - | 已解决 |
-| ASR segment 队列满丢弃 | `try_send` 丢弃新段 | 可能丢识别结果 | P1 |
+| ASR segment 队列满阻塞 | spawn_blocking 中 `blocking_send` | VAD 线程背压导致延迟上升 | P1 |
 | RMS 采样点 | 写入端 (非播放端) | 唇形有 prefill 提前量 (~50ms) | P1 |
 
 ---
@@ -466,5 +496,4 @@ rcat-voice/
 
 - [README.md](./README.md) - 文档索引
 - [FEATURE_MAP.md](./FEATURE_MAP.md) - 功能-代码映射
-- [OPTIMIZATIONS.md](./OPTIMIZATIONS.md) - 优化建议
 - [TROUBLESHOOTING.md](./TROUBLESHOOTING.md) - 故障排查

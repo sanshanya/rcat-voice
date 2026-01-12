@@ -14,9 +14,9 @@
 
 ## 流水线时序
 
-> **实测5070TI首播时延180-400ms**
+> **实测 5070TI 音频生成延迟（TTS_TTFA）180-400ms**
 >
-> 实测4060移动端首播时延450-800ms
+> 实测 4060 移动端音频生成延迟（TTS_TTFA）450-800ms
 
 下图展示了 **Serial Mode（默认）** 下各阶段的覆盖范围和并行度：
 
@@ -64,16 +64,19 @@ gantt
 $env:OPENAI_API_KEY = "your-api-key"
 $env:OPENAI_BASE_URL = "https://api.deepseek.com/v1"
 
-# 2. ASR 配置
-$env:ASR_MODELS_ROOT = "asrmodel"
+# 2. 统一模型目录（推荐：只需这一个路径）
+# 目录结构参考：rcat/models/README.md
+$env:RCAT_MODELS_DIR = "F:\\github\\rcat\\models"
+
+# 3. ASR 配置
 $env:ASR_MODEL = "funasr-nano-int8"
 
-# 3. TTS 后端 (选一)
+# 4. TTS 后端 (选一)
 $env:TTS_BACKEND = "os"              # 系统 TTS (最简单)
 # $env:TTS_BACKEND = "gpt-sovits-onnx" # GPT-SoVITS CPU
 # $env:TTS_BACKEND = "gpt-sovits"      # GPT-SoVITS CUDA (Windows only)
 
-# 4. 运行
+# 5. 运行
 cargo run --example voice_assistant --features asr-sherpa,asr-mic,turn-smart --release
 ```
 
@@ -81,11 +84,11 @@ cargo run --example voice_assistant --features asr-sherpa,asr-mic,turn-smart --r
 
 ## 关键性能指标
 
-| 指标               | 全称                | 定义                             | 典型目标 |
-| ------------------ | ------------------- | -------------------------------- | -------- |
-| **LLM_TTFT** | Time To First Token | LLM 请求 → 首个非空 delta 到达  | < 500ms  |
-| **TTS_TTFA** | TTS 首音频可播时延  | TTS 开始 → 首个样本估算首播时间 | < 300ms  |
-| **E2E_TTFA** | End-to-End TTFA     | 用户说完 → 首个音频估算首播时间 | < 400ms  |
+| 指标               | 全称                | 定义                            | 典型目标 |
+| ------------------ | ------------------- | ------------------------------- | -------- |
+| **LLM_TTFT** | Time To First Token | LLM 请求 → 首个非空 delta 到达 | < 500ms  |
+| **TTS_TTFA** | 音频生成延迟        | 首段送入 TTS → 首音（可播）    | < 300ms  |
+| **E2E_TTFA** | 端到端延迟          | 用户说完 → 首音（可播）        | < 800ms  |
 
 ---
 
@@ -95,7 +98,6 @@ cargo run --example voice_assistant --features asr-sherpa,asr-mic,turn-smart --r
 | ------------------------------------------ | ---------------------------------- |
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md)       | 数据流、Channel 拓扑、时间指标定义 |
 | [FEATURE_MAP.md](docs/FEATURE_MAP.md)         | 功能-代码映射                      |
-| [OPTIMIZATIONS.md](docs/OPTIMIZATIONS.md)     | 优化项与已知限制                   |
 | [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | 故障排查                           |
 
 ---

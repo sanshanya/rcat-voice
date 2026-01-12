@@ -1,4 +1,4 @@
-﻿use super::AsrSegment;
+use super::AsrSegment;
 use super::utils::{LinearResampler, pcm_i16_le_bytes_to_vec, pcm_i16_to_mono_f32};
 use super::{VadEvent, VadState};
 use anyhow::{Result, anyhow, bail};
@@ -11,7 +11,8 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tracing::info;
 
-use crate::internal::{env, model_locator};
+use crate::internal::{env, model_locator, models};
+use crate::metrics::{MetricEvent, MetricEventKind, MetricsSink, default_sink};
 
 const DEFAULT_MODELS_ROOT: &str = "models";
 const FALLBACK_MODELS_ROOT: &str = "asrmodel";
@@ -126,7 +127,7 @@ impl SherpaVadConfig {
         };
         if !model.exists() {
             bail!(
-                "VAD model not found: {} (expected {} under ASR_MODELS_ROOT or set ASR_VAD_PATH)",
+                "VAD model not found: {} (expected {} under RCAT_MODELS_DIR/VAD or ASR_MODELS_ROOT, or set ASR_VAD_PATH)",
                 model.display(),
                 SILERO_VAD_FILE
             );
@@ -176,6 +177,7 @@ impl SherpaAsrConfig {
     pub fn from_env() -> Result<Self> {
         let models_root = env::string("ASR_MODELS_ROOT")
             .map(PathBuf::from)
+            .or_else(models::asr_dir)
             .unwrap_or_else(|| {
                 let fallback = PathBuf::from(FALLBACK_MODELS_ROOT);
                 if fallback.exists() {
@@ -196,7 +198,8 @@ impl SherpaAsrConfig {
         let segment_queue = env::usize_clamped("ASR_SEGMENT_QUEUE", DEFAULT_SEGMENT_QUEUE, 1, 128);
         let vad_chunk_ms = env::u64_clamped("ASR_VAD_CHUNK_MS", 20, 5, 2000);
 
-        let vad = SherpaVadConfig::from_env(&models_root)?;
+        let vad_root = models::vad_dir().unwrap_or_else(|| models_root.clone());
+        let vad = SherpaVadConfig::from_env(&vad_root)?;
 
         Ok(Self {
             models_root,
@@ -468,6 +471,13 @@ pub struct SherpaAsrStream {
 
 impl SherpaAsrStream {
     pub fn new(config: SherpaAsrConfig) -> Result<Self> {
+        Self::new_with_metrics(config, default_sink())
+    }
+
+    pub fn new_with_metrics(
+        config: SherpaAsrConfig,
+        metrics: Arc<dyn MetricsSink>,
+    ) -> Result<Self> {
         let (model_path, tokens_path) = config.resolve_model_paths()?;
 
         let recognizer = init_recognizer(&config, &model_path, &tokens_path)?;
@@ -490,7 +500,6 @@ impl SherpaAsrStream {
         let (tx, mut in_rx) = mpsc::channel::<InputMsg>(64);
         let (out_tx, rx) = mpsc::channel::<AsrSegment>(64);
 
-        let log_infer = config.infer_log;
         let segment_queue = config.segment_queue;
         let vad_chunk_ms = config.vad_chunk_ms;
         let vad_chunk_samples = ((TARGET_SAMPLE_RATE as u64 * vad_chunk_ms) / 1000).max(1) as usize;
@@ -523,7 +532,7 @@ impl SherpaAsrStream {
             });
 
             let infer_handle = tokio::task::spawn_blocking(move || {
-                run_inference_loop(recognizer, segment_rx, out_tx, log_infer);
+                run_inference_loop(recognizer, segment_rx, out_tx, metrics);
             });
 
             // Async task now only forwards messages to VAD thread (non-blocking)
@@ -563,6 +572,10 @@ impl SherpaAsrStream {
 
     pub fn from_env() -> Result<Self> {
         Self::new(SherpaAsrConfig::from_env()?)
+    }
+
+    pub fn from_env_with_metrics(metrics: Arc<dyn MetricsSink>) -> Result<Self> {
+        Self::new_with_metrics(SherpaAsrConfig::from_env()?, metrics)
     }
 
     pub async fn write_pcm_i16_le_bytes(
@@ -826,24 +839,22 @@ fn run_inference_loop(
     mut recognizer: SherpaRecognizer,
     mut segment_rx: mpsc::Receiver<VadSegment>,
     out_tx: mpsc::Sender<AsrSegment>,
-    log_infer: bool,
+    metrics: Arc<dyn MetricsSink>,
 ) {
     let mut idx: usize = 0;
     while let Some(segment) = segment_rx.blocking_recv() {
         let infer_start = Instant::now();
         let text = recognizer.transcribe(TARGET_SAMPLE_RATE, &segment.samples);
         let infer_ms = infer_start.elapsed().as_millis() as u64;
+        metrics.on_event(MetricEvent {
+            turn_id: 0,
+            kind: MetricEventKind::AsrInference { infer_ms },
+            ts: Instant::now(),
+        });
 
         let text = text.trim().to_string();
         if text.is_empty() {
             continue;
-        }
-
-        if log_infer {
-            info!(
-                "asr: segment idx={} start={:.2}s end={:.2}s infer_ms={}",
-                idx, segment.start, segment.end, infer_ms
-            );
         }
 
         let seg = AsrSegment {

@@ -9,14 +9,16 @@ use async_openai::{
 };
 use futures::StreamExt;
 use rcat_voice::generator;
-use rcat_voice::streaming::{StreamControl, StreamSession};
-use serde_json::json;
+use rcat_voice::metrics::{MetricEvent, MetricEventKind, MetricsSink, TracingMetricsSink};
+use rcat_voice::streaming::{StreamControl, StreamSession, StreamSessionBuilder};
 use serde_json::Value;
+use serde_json::json;
 use std::io::{self, Write};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
@@ -40,11 +42,12 @@ async fn main() -> Result<()> {
         std::env::var("OPENAI_API_KEY")
             .context("OPENAI_API_KEY is required for terminal_chat example")?,
     );
-    let model = Arc::new(
-        std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "deepseek-chat".to_string()),
-    );
+    let model =
+        Arc::new(std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "deepseek-chat".to_string()));
 
     let tts_engine = generator::build_from_env()?;
+    let metrics: Arc<dyn MetricsSink> = Arc::new(TracingMetricsSink::from_env());
+    let mut turn_id: u64 = 1;
     let mut current: Option<RunningChat> = None;
 
     let stdin = BufReader::new(tokio::io::stdin());
@@ -68,7 +71,18 @@ async fn main() -> Result<()> {
             stop_running(running).await?;
         }
 
-        let session = StreamSession::from_env(tts_engine.clone());
+        let this_turn_id = turn_id;
+        turn_id = turn_id.wrapping_add(1);
+        metrics.on_event(MetricEvent {
+            turn_id: this_turn_id,
+            kind: MetricEventKind::TurnEnd,
+            ts: Instant::now(),
+        });
+
+        let session = StreamSessionBuilder::from_env(tts_engine.clone())
+            .turn_id(this_turn_id)
+            .metrics_sink(metrics.clone())
+            .build();
         let control = session.control();
         control.mark_llm_start();
 
