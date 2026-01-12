@@ -51,7 +51,10 @@ impl SmartTurnModel {
             );
         }
         if !is_model_path(model) {
-            bail!("SMART_TURN_MODEL must point to a .onnx file, got: {}", model.display());
+            bail!(
+                "SMART_TURN_MODEL must point to a .onnx file, got: {}",
+                model.display()
+            );
         }
 
         #[cfg(all(target_os = "windows", feature = "gpt-sovits"))]
@@ -125,7 +128,8 @@ impl TurnAudioBuffer {
         let keep = self.max_samples;
         if samples.len() >= keep {
             self.data.clear();
-            self.data.extend(samples.iter().copied().skip(samples.len() - keep));
+            self.data
+                .extend(samples.iter().copied().skip(samples.len() - keep));
             return;
         }
 
@@ -189,8 +193,13 @@ impl SmartTurnDetector {
     }
 
     /// Reset accumulated turn audio (start a new user turn).
+    ///
+    /// Also clears input_format and resampler to allow format changes
+    /// (e.g., warmup at 16kHz → microphone at 48kHz).
     pub fn reset(&mut self) {
         self.audio.clear();
+        self.input_format = None;
+        self.resampler = None;
     }
 
     /// Returns the current 8s (right-aligned) audio window as 16kHz mono samples, padded with zeros.
@@ -255,11 +264,9 @@ impl SmartTurnDetector {
 
 /// Convenience: load a Smart Turn model from the default env var and return the resolved path.
 pub fn model_path_from_env() -> Result<PathBuf> {
-    let model = env::string("SMART_TURN_MODEL")
-        .map(PathBuf::from)
-        .context(
-            "SMART_TURN_MODEL is required (path to smart-turn-v3*.onnx, or a directory containing it)",
-        )?;
+    let model = env::string("SMART_TURN_MODEL").map(PathBuf::from).context(
+        "SMART_TURN_MODEL is required (path to smart-turn-v3*.onnx, or a directory containing it)",
+    )?;
     resolve_smart_turn_model_path(model)
 }
 
@@ -295,9 +302,12 @@ fn resolve_smart_turn_model_path(model: PathBuf) -> Result<PathBuf> {
 
 fn resolve_smart_turn_model_in_dir(dir: &Path) -> Result<PathBuf> {
     let mut candidates = Vec::<PathBuf>::new();
-    for entry in std::fs::read_dir(dir)
-        .with_context(|| format!("failed to read SMART_TURN_MODEL directory: {}", dir.display()))?
-    {
+    for entry in std::fs::read_dir(dir).with_context(|| {
+        format!(
+            "failed to read SMART_TURN_MODEL directory: {}",
+            dir.display()
+        )
+    })? {
         let entry = entry?;
         let path = entry.path();
         if !path.is_file() || !is_model_path(&path) {
@@ -384,4 +394,187 @@ fn is_smart_turn_cpu_model_path(model: &Path) -> bool {
     (file_name.contains("smart-turn") || file_name.contains("smart_turn"))
         && file_name.contains("cpu")
         && !file_name.contains("gpu")
+}
+
+// ============================================================================
+// TurnBoundaryDetector Implementation for SmartTurnDetector
+// ============================================================================
+
+use super::types::{AudioFrameRef, TurnBoundaryDetector, TurnDetectorConfig, TurnEvent};
+use crate::asr::VadEvent;
+use smallvec::SmallVec;
+use tokio::time::Instant;
+
+/// Smart Turn 端点检测器（实现 TurnBoundaryDetector trait）
+///
+/// 结合 VAD 事件做静音门控，在静音期间调用 Smart Turn 模型推理端点概率。
+pub struct SmartTurnBoundaryDetector {
+    detector: SmartTurnDetector,
+    config: TurnDetectorConfig,
+    /// 是否在说话
+    speaking: bool,
+    /// 静音开始时刻
+    silence_start_ts: Option<Instant>,
+    /// 上次评估时刻
+    last_eval_ts: Option<Instant>,
+    /// 端点是否已 armed（模型判定为端点）
+    endpoint_armed: bool,
+    /// 是否已提交
+    committed: bool,
+}
+
+impl SmartTurnBoundaryDetector {
+    pub fn new(detector: SmartTurnDetector, config: TurnDetectorConfig) -> Self {
+        Self {
+            detector,
+            config,
+            speaking: false,
+            silence_start_ts: None,
+            last_eval_ts: None,
+            endpoint_armed: false,
+            committed: false,
+        }
+    }
+
+    pub fn from_env() -> Result<Self> {
+        let detector = SmartTurnDetector::from_env()?;
+        let min_silence_ms = env::u64_clamped("SMART_TURN_MIN_SILENCE_MS", 400, 50, 2000);
+        let commit_ms = env::u64_clamped("SMART_TURN_COMMIT_MS", 300, 0, 1000);
+        let min_force_end_ms = min_silence_ms.saturating_add(commit_ms);
+        let config = TurnDetectorConfig {
+            min_silence_ms,
+            commit_ms,
+            force_end_ms: env::u64_clamped(
+                "SMART_TURN_FORCE_END_MS",
+                2000,
+                min_force_end_ms,
+                60_000,
+            ),
+            eval_interval_ms: env::u64_clamped("SMART_TURN_EVAL_INTERVAL_MS", 200, 10, 500),
+            silence_threshold: env::u16_clamped("TURN_SILENCE_THRESHOLD", 200, 0, 20_000),
+        };
+        Ok(Self::new(detector, config))
+    }
+
+    /// 获取内部的 SmartTurnDetector
+    pub fn inner(&self) -> &SmartTurnDetector {
+        &self.detector
+    }
+
+    /// 获取内部的 SmartTurnDetector (mut)
+    pub fn inner_mut(&mut self) -> &mut SmartTurnDetector {
+        &mut self.detector
+    }
+
+    fn trailing_silence_ms(&self, now: Instant) -> u64 {
+        self.silence_start_ts
+            .map(|start| now.saturating_duration_since(start).as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    fn should_eval(&self, now: Instant) -> bool {
+        self.last_eval_ts
+            .map(|t| {
+                now.saturating_duration_since(t).as_millis() as u64 >= self.config.eval_interval_ms
+            })
+            .unwrap_or(true)
+    }
+}
+
+impl TurnBoundaryDetector for SmartTurnBoundaryDetector {
+    fn push_audio(&mut self, frame: AudioFrameRef<'_>, _out: &mut SmallVec<[TurnEvent; 4]>) {
+        if self.committed {
+            return;
+        }
+        // 总是推送音频到 Smart Turn 模型缓冲区
+        let _ = self
+            .detector
+            .push_pcm_i16(frame.samples, frame.sample_rate, frame.channels);
+    }
+
+    fn push_vad(&mut self, event: VadEvent, out: &mut SmallVec<[TurnEvent; 4]>) {
+        if self.committed {
+            return;
+        }
+        match event {
+            VadEvent::SpeechStart { ts } => {
+                self.speaking = true;
+                self.silence_start_ts = None;
+                self.last_eval_ts = None;
+                self.endpoint_armed = false;
+
+                out.push(TurnEvent::speech_start(ts));
+            }
+            VadEvent::SpeechEnd { ts, .. } => {
+                self.speaking = false;
+                self.silence_start_ts = Some(ts);
+                self.last_eval_ts = None;
+                self.endpoint_armed = false;
+
+                out.push(TurnEvent::speech_end(ts));
+            }
+        }
+    }
+
+    fn tick(&mut self, now: Instant, out: &mut SmallVec<[TurnEvent; 4]>) {
+        if self.committed {
+            return;
+        }
+        // 只在有语音且当前静音时评估
+        if self.speaking || self.silence_start_ts.is_none() {
+            return;
+        }
+
+        let silence_ms = self.trailing_silence_ms(now);
+
+        // 强制结束检查
+        if silence_ms >= self.config.force_end_ms {
+            out.push(TurnEvent::turn_committed(now));
+            self.committed = true;
+            return;
+        }
+
+        // 只在超过 min_silence 后开始评估
+        if silence_ms < self.config.min_silence_ms {
+            return;
+        }
+
+        // 评估间隔检查 + Smart Turn 推理
+        if self.should_eval(now) && !self.endpoint_armed {
+            self.last_eval_ts = Some(now);
+
+            // 同步调用 Smart Turn 推理（注意：这是阻塞操作）
+            if let Ok(decision) = self.detector.predict_endpoint() {
+                self.endpoint_armed = decision.endpoint;
+            }
+        }
+
+        // 端点已 armed 且达到 commit 阈值
+        if self.endpoint_armed {
+            let commit_threshold = self
+                .config
+                .min_silence_ms
+                .saturating_add(self.config.commit_ms);
+            if silence_ms >= commit_threshold {
+                out.push(TurnEvent::turn_committed(now));
+                self.committed = true;
+            }
+        }
+    }
+
+    fn reset(&mut self) {
+        self.detector.reset();
+        self.speaking = false;
+        self.silence_start_ts = None;
+        self.last_eval_ts = None;
+        self.endpoint_armed = false;
+        self.committed = false;
+    }
+}
+
+impl SmartTurnBoundaryDetector {
+    /// 获取配置
+    pub fn config(&self) -> &TurnDetectorConfig {
+        &self.config
+    }
 }

@@ -26,8 +26,14 @@ use tokio::sync::{mpsc, watch};
 #[cfg(all(feature = "asr-sherpa", feature = "asr-mic"))]
 use tokio::task::JoinHandle;
 
+#[cfg(all(feature = "asr-sherpa", feature = "asr-mic"))]
+use rcat_voice::turn::{
+    AudioFrameRef, TurnBoundaryDetector, TurnEvent, TurnEventKind, VadGateTurnDetector,
+};
 #[cfg(all(feature = "asr-sherpa", feature = "asr-mic", feature = "turn-smart"))]
-use rcat_voice::turn::SmartTurnDetector;
+use rcat_voice::turn::SmartTurnBoundaryDetector;
+#[cfg(all(feature = "asr-sherpa", feature = "asr-mic"))]
+use smallvec::SmallVec;
 
 #[cfg(not(feature = "asr-sherpa"))]
 fn main() {
@@ -42,14 +48,54 @@ fn main() {
 }
 
 #[cfg(all(feature = "asr-sherpa", feature = "asr-mic"))]
+enum TurnDetector {
+    Vad(VadGateTurnDetector),
+    #[cfg(feature = "turn-smart")]
+    Smart(SmartTurnBoundaryDetector),
+}
+
+#[cfg(all(feature = "asr-sherpa", feature = "asr-mic"))]
+impl TurnBoundaryDetector for TurnDetector {
+    fn push_audio(&mut self, frame: AudioFrameRef<'_>, out: &mut SmallVec<[TurnEvent; 4]>) {
+        match self {
+            TurnDetector::Vad(inner) => inner.push_audio(frame, out),
+            #[cfg(feature = "turn-smart")]
+            TurnDetector::Smart(inner) => inner.push_audio(frame, out),
+        }
+    }
+
+    fn push_vad(&mut self, event: rcat_voice::asr::VadEvent, out: &mut SmallVec<[TurnEvent; 4]>) {
+        match self {
+            TurnDetector::Vad(inner) => inner.push_vad(event, out),
+            #[cfg(feature = "turn-smart")]
+            TurnDetector::Smart(inner) => inner.push_vad(event, out),
+        }
+    }
+
+    fn tick(&mut self, now: tokio::time::Instant, out: &mut SmallVec<[TurnEvent; 4]>) {
+        match self {
+            TurnDetector::Vad(inner) => inner.tick(now, out),
+            #[cfg(feature = "turn-smart")]
+            TurnDetector::Smart(inner) => inner.tick(now, out),
+        }
+    }
+
+    fn reset(&mut self) {
+        match self {
+            TurnDetector::Vad(inner) => inner.reset(),
+            #[cfg(feature = "turn-smart")]
+            TurnDetector::Smart(inner) => inner.reset(),
+        }
+    }
+}
+
+#[cfg(all(feature = "asr-sherpa", feature = "asr-mic"))]
 #[tokio::main]
 async fn main() -> Result<()> {
     use cpal::traits::{DeviceTrait, StreamTrait};
     use crossbeam_queue::ArrayQueue;
     use std::sync::atomic::{AtomicU64, Ordering};
-    #[cfg(feature = "turn-smart")]
-    use std::time::Instant;
-    use tokio::time::{Duration, MissedTickBehavior};
+    use tokio::time::{Duration, Instant, MissedTickBehavior};
     use tracing::{debug, info, warn};
     use tracing_subscriber::EnvFilter;
 
@@ -172,80 +218,47 @@ async fn main() -> Result<()> {
         .unwrap_or(100)
         .clamp(0, 1000);
 
-    #[cfg(feature = "turn-smart")]
-    let turn_min_silence_ms = std::env::var("SMART_TURN_MIN_SILENCE_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(400)
-        .clamp(50, 10_000);
+    let barge_in_threshold_ms = barge_in_confirm_ms.saturating_add(barge_in_min_speech_ms);
 
-    #[cfg(feature = "turn-smart")]
-    let turn_commit_ms = std::env::var("SMART_TURN_COMMIT_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(300)
-        .clamp(0, 10_000);
-
-    #[cfg(feature = "turn-smart")]
-    let turn_force_end_ms = std::env::var("SMART_TURN_FORCE_END_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(2000)
-        .clamp(turn_min_silence_ms.saturating_add(turn_commit_ms), 60_000);
-
-    #[cfg(feature = "turn-smart")]
-    let turn_eval_interval_ms = std::env::var("SMART_TURN_EVAL_INTERVAL_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(200)
-        .clamp(50, 5000);
-
-    let turn_silence_abs = std::env::var("SMART_TURN_SILENCE_ABS")
-        .ok()
-        .and_then(|v| v.parse::<u16>().ok())
-        .unwrap_or(200)
-        .clamp(0, 20_000);
-
-    let barge_in_silence_abs = std::env::var("BARGE_IN_SILENCE_ABS")
-        .ok()
-        .and_then(|v| v.parse::<u16>().ok())
-        .unwrap_or(turn_silence_abs)
-        .clamp(0, 20_000);
-
-    #[cfg(feature = "turn-smart")]
-    let mut smart_turn: Option<SmartTurnDetector> = match std::env::var("SMART_TURN_MODEL") {
-        Ok(value) if !value.trim().is_empty() => {
-            let detector = SmartTurnDetector::from_env()?;
-            info!(
-                "voice_assistant: smart_turn enabled (threshold={:.2}, model={})",
-                detector.threshold(),
-                value
-            );
-            info!(
-                "voice_assistant: smart_turn gate: min_silence_ms={} commit_ms={} force_end_ms={} eval_interval_ms={} silence_abs={}",
-                turn_min_silence_ms,
-                turn_commit_ms,
-                turn_force_end_ms,
-                turn_eval_interval_ms,
-                turn_silence_abs,
-            );
-            Some(detector)
+    let mut turn_detector = {
+        #[cfg(feature = "turn-smart")]
+        {
+            match std::env::var("SMART_TURN_MODEL") {
+                Ok(value) if !value.trim().is_empty() => {
+                    let detector = SmartTurnBoundaryDetector::from_env()?;
+                    let cfg = detector.config();
+                    info!(
+                        "voice_assistant: smart_turn enabled (threshold={:.2}, model={})",
+                        detector.inner().threshold(),
+                        value
+                    );
+                    info!(
+                        "voice_assistant: turn gate: min_silence_ms={} commit_ms={} force_end_ms={} eval_interval_ms={}",
+                        cfg.min_silence_ms, cfg.commit_ms, cfg.force_end_ms, cfg.eval_interval_ms
+                    );
+                    TurnDetector::Smart(detector)
+                }
+                _ => TurnDetector::Vad(VadGateTurnDetector::from_env()),
+            }
         }
-        _ => None,
+        #[cfg(not(feature = "turn-smart"))]
+        {
+            TurnDetector::Vad(VadGateTurnDetector::from_env())
+        }
     };
 
     // === Model Warmup (eliminate first-turn latency spikes) ===
     #[cfg(feature = "turn-smart")]
-    if let Some(detector) = smart_turn.as_mut() {
-        // Smart Turn warmup: predict on 8s of silence (16kHz mono)
+    if let TurnDetector::Smart(detector) = &mut turn_detector {
+        // Smart Turn warmup: predict on 8s of silence (16kHz mono).
         let zeros = vec![0i16; 16000 * 8];
-        if let Err(e) = detector.push_pcm_i16(&zeros, 16000, 1) {
+        if let Err(e) = detector.inner_mut().push_pcm_i16(&zeros, 16000, 1) {
             warn!("Smart turn warmup failed: {e}");
         } else {
-            let _ = detector
-                .model()
-                .predict_probability(&detector.snapshot_audio());
-            detector.reset();
+            let model = detector.inner().model();
+            let audio = detector.inner().snapshot_audio();
+            let _ = model.predict_probability(&audio);
+            turn_detector.reset();
             info!("voice_assistant: smart_turn warmup complete");
         }
     }
@@ -267,21 +280,8 @@ async fn main() -> Result<()> {
     let mut assistant: Option<RunningAssistant> = None;
 
     let mut turn_text = String::new();
-    let mut speech_streak_ms: u64 = 0;
-    let mut consecutive_non_silence_ms: u64 = 0; // Dual-gate confirmation counter
-
-    #[cfg(feature = "turn-smart")]
-    let mut smart_turn_threshold = smart_turn.as_ref().map(|d| d.threshold()).unwrap_or(0.5);
-    #[cfg(feature = "turn-smart")]
-    let mut turn_dirty = false;
-    #[cfg(feature = "turn-smart")]
-    let mut trailing_silence_ms: u64 = 0;
-    #[cfg(feature = "turn-smart")]
-    let mut endpoint_armed = false;
-    #[cfg(feature = "turn-smart")]
-    let mut last_eval_at: Option<Instant> = None;
-    #[cfg(feature = "turn-smart")]
-    let mut smart_turn_infer: Option<tokio::task::JoinHandle<Result<f32>>> = None;
+    let mut barge_in_speech_start_ts: Option<Instant> = None;
+    let mut events = SmallVec::<[TurnEvent; 4]>::new();
 
     let frames = ((sample_rate as u64 * feed_ms) / 1000).max(1) as usize;
     let chunk_samples = frames
@@ -337,6 +337,21 @@ async fn main() -> Result<()> {
                     }
                 }
 
+                let now = Instant::now();
+                events.clear();
+
+                while let Some(vad) = asr.try_read_vad_event() {
+                    match &vad {
+                        rcat_voice::asr::VadEvent::SpeechStart { ts } => {
+                            barge_in_speech_start_ts = Some(*ts);
+                        }
+                        rcat_voice::asr::VadEvent::SpeechEnd { .. } => {
+                            barge_in_speech_start_ts = None;
+                        }
+                    }
+                    turn_detector.push_vad(vad, &mut events);
+                }
+
                 while chunk.len() < chunk_samples {
                     let Some(sample) = queue.pop() else {
                         break;
@@ -345,56 +360,13 @@ async fn main() -> Result<()> {
                 }
 
                 if chunk.len() >= chunk_samples {
-                    // Dual-gate barge-in:
-                    // Gate 1 (coarse): energy threshold
-                    let is_silence = is_silence_chunk(&chunk, barge_in_silence_abs);
-
-                    if is_silence {
-                        // Reset both counters on silence
-                        consecutive_non_silence_ms = 0;
-                        speech_streak_ms = 0;
-                    } else {
-                        // Gate 2 (confirmation): require consecutive non-silence frames
-                        consecutive_non_silence_ms = consecutive_non_silence_ms.saturating_add(feed_ms);
-                        if consecutive_non_silence_ms >= barge_in_confirm_ms {
-                            // Only count towards speech after confirmation window passed
-                            speech_streak_ms = speech_streak_ms.saturating_add(feed_ms);
-                        }
-                    }
-
-                    if let Some(running) = assistant.as_mut() {
-                        if !running.cancel_requested && speech_streak_ms >= barge_in_min_speech_ms {
-                            warn!(
-                                "voice_assistant: barge-in detected (speech_ms={} >= {}, confirm_ms={}), cancelling assistant",
-                                speech_streak_ms, barge_in_min_speech_ms, barge_in_confirm_ms
-                            );
-                            speech_streak_ms = 0;
-                            consecutive_non_silence_ms = 0;
-                            running.cancel_requested = true;
-                            let _ = running.cancel_tx.send(true);
-                            let cancel_handle = running.cancel_handle.clone();
-                            tokio::spawn(async move {
-                                let _ = cancel_handle.cancel().await;
-                            });
-                        }
-                    }
-
-                    #[cfg(feature = "turn-smart")]
-                    if let Some(detector) = smart_turn.as_mut() {
-                        let is_silence = is_silence_chunk(&chunk, turn_silence_abs);
-                        if is_silence {
-                            trailing_silence_ms = trailing_silence_ms.saturating_add(feed_ms);
-                        } else {
-                            trailing_silence_ms = 0;
-                            endpoint_armed = false;
-                            if let Some(handle) = smart_turn_infer.take() {
-                                handle.abort();
-                            }
-                            last_eval_at = None;
-                        }
-                        detector.push_pcm_i16(&chunk, sample_rate, channels)?;
-                    }
-
+                    let frame = AudioFrameRef {
+                        samples: &chunk,
+                        sample_rate,
+                        channels,
+                        ts: now,
+                    };
+                    turn_detector.push_audio(frame, &mut events);
                     asr.write_pcm_i16(&chunk, sample_rate, channels).await?;
                     chunk.clear();
                 }
@@ -405,100 +377,53 @@ async fn main() -> Result<()> {
                         turn_text.push(' ');
                     }
                     turn_text.push_str(&seg.text);
+                }
 
-                    #[cfg(feature = "turn-smart")]
-                    {
-                        turn_dirty = true;
-                    }
+                turn_detector.tick(now, &mut events);
 
-                    let should_fallback_turn = {
-                        #[cfg(feature = "turn-smart")]
-                        {
-                            smart_turn.is_none()
-                        }
-                        #[cfg(not(feature = "turn-smart"))]
-                        {
-                            true
-                        }
-                    };
-
-                    if should_fallback_turn {
-                        // No smart-turn: treat each VAD segment as a complete user turn.
-                        let user_text = turn_text.trim().to_string();
-                        turn_text.clear();
-                        if !user_text.is_empty() {
-                            if let Some(running) = assistant.take() {
-                                stop_running(running).await?;
+                if let Some(running) = assistant.as_mut() {
+                    if !running.cancel_requested {
+                        if let Some(start_ts) = barge_in_speech_start_ts {
+                            let speech_ms =
+                                now.saturating_duration_since(start_ts).as_millis() as u64;
+                            if speech_ms >= barge_in_threshold_ms {
+                                warn!(
+                                    "voice_assistant: barge-in detected (speech_ms={} >= {}, confirm_ms={}), cancelling assistant",
+                                    speech_ms, barge_in_min_speech_ms, barge_in_confirm_ms
+                                );
+                                running.cancel_requested = true;
+                                let _ = running.cancel_tx.send(true);
+                                let cancel_handle = running.cancel_handle.clone();
+                                tokio::spawn(async move {
+                                    let _ = cancel_handle.cancel().await;
+                                });
                             }
-                            messages.push(ChatCompletionRequestMessage::User(
-                                ChatCompletionRequestUserMessageArgs::default()
-                                    .content(user_text.clone())
-                                    .build()?,
-                            ));
-                            trim_history(&mut messages, history_max_messages);
-                            println!("USER: {user_text}");
-                            assistant = Some(
-                                start_assistant(
-                                    tts_engine.clone(),
-                                    llm_client.clone(),
-                                    model.clone(),
-                                    messages.clone(),
-                                    std::time::Instant::now(),
-                                )
-                                .await?,
-                            );
                         }
                     }
                 }
 
-                #[cfg(feature = "turn-smart")]
-                if smart_turn_infer
-                    .as_ref()
-                    .is_some_and(|handle| handle.is_finished())
-                {
-                    let handle = smart_turn_infer.take().expect("smart_turn_infer");
-                    match handle.await {
-                        Ok(Ok(prob)) => {
-                            smart_turn_threshold = smart_turn_threshold.clamp(0.0, 1.0);
-                            endpoint_armed = prob >= smart_turn_threshold;
-                            println!(
-                                "smart_turn: p={:.3} endpoint={} silence_ms={}",
-                                prob, endpoint_armed, trailing_silence_ms
-                            );
-                            turn_dirty = false;
-                        }
-                        Ok(Err(e)) => {
-                            warn!("smart_turn: predict failed: {e}");
-                            endpoint_armed = false;
-                        }
-                        Err(e) => {
-                            warn!("smart_turn: predict task failed: {e}");
-                            endpoint_armed = false;
-                        }
+                let mut committed = false;
+                for event in events.drain(..) {
+                    if event.kind == TurnEventKind::TurnCommitted {
+                        committed = true;
                     }
                 }
 
-                #[cfg(feature = "turn-smart")]
-                if let Some(detector) = smart_turn.as_mut() {
-                    if turn_text.trim().is_empty() {
-                        endpoint_armed = false;
-                        turn_dirty = false;
-                        if let Some(handle) = smart_turn_infer.take() {
-                            handle.abort();
+                if committed {
+                    while let Some(seg) = asr.try_read() {
+                        println!("[{:.2}-{:.2}] {}", seg.start, seg.end, seg.text);
+                        if !turn_text.is_empty() {
+                            turn_text.push(' ');
                         }
-                    } else if trailing_silence_ms >= turn_force_end_ms {
-                        let user_text = turn_text.trim().to_string();
-                        println!("TURN_END: {}", user_text);
-                        turn_text.clear();
-                        detector.reset();
-                        trailing_silence_ms = 0;
-                        endpoint_armed = false;
-                        turn_dirty = false;
-                        last_eval_at = None;
-                        if let Some(handle) = smart_turn_infer.take() {
-                            handle.abort();
-                        }
+                        turn_text.push_str(&seg.text);
+                    }
 
+                    let user_text = turn_text.trim().to_string();
+                    turn_text.clear();
+                    barge_in_speech_start_ts = None;
+                    turn_detector.reset();
+
+                    if !user_text.is_empty() {
                         if let Some(running) = assistant.take() {
                             stop_running(running).await?;
                         }
@@ -509,62 +434,16 @@ async fn main() -> Result<()> {
                         ));
                         trim_history(&mut messages, history_max_messages);
                         println!("USER: {user_text}");
-                        assistant = Some(start_assistant(
-                            tts_engine.clone(),
-                            llm_client.clone(),
-                            model.clone(),
-                            messages.clone(),
-                            std::time::Instant::now(),
-                        ).await?);
-                    } else if trailing_silence_ms >= turn_min_silence_ms {
-                        let now = Instant::now();
-                        let should_eval = turn_dirty
-                            || last_eval_at
-                                .map(|t| now.duration_since(t).as_millis() as u64 >= turn_eval_interval_ms)
-                                .unwrap_or(true);
-                        if should_eval && smart_turn_infer.is_none() {
-                            let audio = detector.snapshot_audio();
-                            let model = detector.model();
-                            smart_turn_infer = Some(tokio::task::spawn_blocking(move || {
-                                model.predict_probability(&audio)
-                            }));
-                            last_eval_at = Some(now);
-                        }
-
-                        if endpoint_armed
-                            && trailing_silence_ms
-                                >= turn_min_silence_ms.saturating_add(turn_commit_ms)
-                        {
-                            let user_text = turn_text.trim().to_string();
-                            println!("TURN_END: {}", user_text);
-                            turn_text.clear();
-                            detector.reset();
-                            trailing_silence_ms = 0;
-                            endpoint_armed = false;
-                            turn_dirty = false;
-                            last_eval_at = None;
-                            if let Some(handle) = smart_turn_infer.take() {
-                                handle.abort();
-                            }
-
-                            if let Some(running) = assistant.take() {
-                                stop_running(running).await?;
-                            }
-                            messages.push(ChatCompletionRequestMessage::User(
-                                ChatCompletionRequestUserMessageArgs::default()
-                                    .content(user_text.clone())
-                                    .build()?,
-                            ));
-                            trim_history(&mut messages, history_max_messages);
-                            println!("USER: {user_text}");
-                            assistant = Some(start_assistant(
+                        assistant = Some(
+                            start_assistant(
                                 tts_engine.clone(),
                                 llm_client.clone(),
                                 model.clone(),
                                 messages.clone(),
                                 std::time::Instant::now(),
-                            ).await?);
-                        }
+                            )
+                            .await?,
+                        );
                     }
                 }
             }
@@ -844,16 +723,3 @@ fn build_cpal_stream(
     }
 }
 
-#[cfg(all(feature = "asr-sherpa", feature = "asr-mic"))]
-fn is_silence_chunk(pcm: &[i16], abs_threshold: u16) -> bool {
-    if pcm.is_empty() {
-        return true;
-    }
-    let threshold = abs_threshold as i64;
-    let mut sum: i64 = 0;
-    for &sample in pcm {
-        sum += (sample as i32).abs() as i64;
-    }
-    let avg = sum / pcm.len() as i64;
-    avg <= threshold
-}

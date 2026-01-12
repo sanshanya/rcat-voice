@@ -8,17 +8,21 @@ use tokio::time::Instant;
 #[cfg(target_os = "windows")]
 use tracing::warn;
 
+use crate::audio::CancelToken;
+
 /// OS-native TTS implementation using system commands.
 #[derive(Clone)]
 pub struct OsTts {
     /// Keep track of the current child process to kill it on stop/cancel.
     current_child: Arc<Mutex<Option<tokio::process::Child>>>,
+    cancel: CancelToken,
 }
 
 impl OsTts {
     pub fn new() -> Self {
         Self {
             current_child: Arc::new(Mutex::new(None)),
+            cancel: CancelToken::new(),
         }
     }
 }
@@ -75,9 +79,13 @@ impl TtsEngine for OsTts {
     }
 
     fn stop_fast(&self) {
-        // OS TTS requires async process kill, cannot provide true O(1) stop
-        // The best we can do is nothing - the async stop() will handle it
-        // This is acceptable because OsTts is not used in low-latency paths
+        // Best-effort epoch bump for cancellation semantics (O(1)).
+        // OS TTS process kill still requires async stop().
+        self.cancel.cancel();
+    }
+
+    fn cancel_token(&self) -> Option<CancelToken> {
+        Some(self.cancel.clone())
     }
 }
 

@@ -50,7 +50,6 @@ async fn run_round(
     let llm_start = Arc::new(OnceLock::new());
 
     let (cancel_tx, cancel_rx) = watch::channel(false);
-    let (_interrupt_tx, interrupt_rx) = watch::channel(0u64);
     let (delta_tx, delta_rx) = mpsc::channel::<String>(8192);
     let (chunk_tx, chunk_rx) = mpsc::channel::<Segment>(4096);
     let (buffer_tx, buffer_rx) = watch::channel(0u64);
@@ -109,8 +108,6 @@ async fn run_round(
     // Task 1: Player (Consumer of Segments)
     let pipeline = Pipeline::new(
         chunk_rx,
-        cancel_rx.clone(),
-        interrupt_rx.clone(),
         tts_engine.clone(),
         PipelineConfig::from_env(),
     );
@@ -120,8 +117,6 @@ async fn run_round(
     let tokenizer = Tokenizer::new(
         delta_rx,
         chunk_tx,
-        cancel_rx.clone(),
-        interrupt_rx.clone(),
         buffer_rx,
         session_start_ts,
         llm_start.clone(),
@@ -147,7 +142,7 @@ async fn run_round(
         simulated_text,
         chunk_chars,
         Duration::from_millis(delay_ms),
-        delta_tx,
+        delta_tx.clone(),
         cancel_rx.clone(),
         llm_start.clone(),
     ));
@@ -157,6 +152,9 @@ async fn run_round(
     } else {
         info!("Sim stream finished successfully (round {}).", round);
     }
+
+    // Close delta input so tokenizer can drain and exit.
+    drop(delta_tx);
 
     // Wait for others to drain if needed, or close app
     // In a real app we might wait for the player queue to drain.

@@ -107,8 +107,6 @@ impl TokenizerConfig {
 pub struct Tokenizer {
     delta_rx: mpsc::Receiver<String>,
     chunk_tx: mpsc::Sender<Segment>,
-    cancel_rx: watch::Receiver<bool>,
-    interrupt_rx: watch::Receiver<u64>,
     buffer_ms_rx: watch::Receiver<u64>,
     session_start_ts: Instant, // t0 fallback
     llm_start: Arc<OnceLock<Instant>>,
@@ -119,8 +117,6 @@ impl Tokenizer {
     pub fn new(
         delta_rx: mpsc::Receiver<String>,
         chunk_tx: mpsc::Sender<Segment>,
-        cancel_rx: watch::Receiver<bool>,
-        interrupt_rx: watch::Receiver<u64>,
         buffer_ms_rx: watch::Receiver<u64>,
         session_start_ts: Instant,
         llm_start: Arc<OnceLock<Instant>>,
@@ -129,8 +125,6 @@ impl Tokenizer {
         Self {
             delta_rx,
             chunk_tx,
-            cancel_rx,
-            interrupt_rx,
             buffer_ms_rx,
             session_start_ts,
             llm_start,
@@ -141,8 +135,6 @@ impl Tokenizer {
     pub fn from_env(
         delta_rx: mpsc::Receiver<String>,
         chunk_tx: mpsc::Sender<Segment>,
-        cancel_rx: watch::Receiver<bool>,
-        interrupt_rx: watch::Receiver<u64>,
         buffer_ms_rx: watch::Receiver<u64>,
         session_start_ts: Instant,
         llm_start: Arc<OnceLock<Instant>>,
@@ -150,8 +142,6 @@ impl Tokenizer {
         Self::new(
             delta_rx,
             chunk_tx,
-            cancel_rx,
-            interrupt_rx,
             buffer_ms_rx,
             session_start_ts,
             llm_start,
@@ -203,34 +193,12 @@ impl Tokenizer {
         let mut first_delta_ts: Option<Instant> = None;
         let mut last_delta_ts: Option<Instant> = None;
         let mut eager_chunks_remaining = self.config.eager_chunks;
-        let eager_chunks_default = eager_chunks_remaining;
-        let mut cancel_closed = false;
-        let mut interrupt_closed = false;
 
         let relax_buffer_ms = self.config.relax_buffer_ms;
         let relax_log = self.config.relax_log;
         let mut relax_active = false;
         'run: loop {
             tokio::select! {
-                res = self.cancel_rx.changed(), if !cancel_closed => {
-                    if res.is_err() {
-                        cancel_closed = true;
-                        continue;
-                    }
-                    if *self.cancel_rx.borrow() { break; }
-                }
-                res = self.interrupt_rx.changed(), if !interrupt_closed => {
-                    if res.is_err() {
-                        interrupt_closed = true;
-                        continue;
-                    }
-                    buf.clear();
-                    while self.delta_rx.try_recv().is_ok() {}
-                    first = true;
-                    first_delta_ts = None;
-                    last_delta_ts = None;
-                    eager_chunks_remaining = eager_chunks_default;
-                }
                 maybe = self.delta_rx.recv() => {
                     let is_eof = maybe.is_none();
                     if let Some(delta) = maybe {
@@ -527,8 +495,6 @@ mod tests {
     async fn tokenizer_flushes_multiple_segments_from_single_delta() {
         let (delta_tx, delta_rx) = tokio::sync::mpsc::channel::<String>(8);
         let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::channel::<Segment>(8);
-        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-        let (_interrupt_tx, interrupt_rx) = tokio::sync::watch::channel(0u64);
         let (_buffer_tx, buffer_rx) = tokio::sync::watch::channel(0u64);
 
         let session_start_ts = Instant::now();
@@ -536,8 +502,6 @@ mod tests {
         let tokenizer = Tokenizer::new(
             delta_rx,
             chunk_tx,
-            cancel_rx,
-            interrupt_rx,
             buffer_rx,
             session_start_ts,
             llm_start,

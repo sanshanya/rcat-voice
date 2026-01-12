@@ -1,12 +1,14 @@
-use super::AsrSegment;
+﻿use super::AsrSegment;
 use super::utils::{LinearResampler, pcm_i16_le_bytes_to_vec, pcm_i16_to_mono_f32};
+use super::{VadEvent, VadState};
 use anyhow::{Result, anyhow, bail};
 use sherpa_rs::paraformer::{ParaformerConfig, ParaformerRecognizer};
 use sherpa_rs::sense_voice::{SenseVoiceConfig, SenseVoiceRecognizer};
 use sherpa_rs::silero_vad::{SileroVad, SileroVadConfig};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
+use tokio::time::Instant;
 use tracing::info;
 
 use crate::internal::{env, model_locator};
@@ -24,8 +26,7 @@ const SILERO_VAD_DIR: &str = "silero_vad";
 const SILERO_VAD_FILE: &str = "silero_vad.onnx";
 const SENSEVOICE_DIR: &str = "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17";
 const SENSEVOICE_FUNASR_NANO_DIR: &str = "sherpa-onnx-sense-voice-funasr-nano-2025-12-17";
-const SENSEVOICE_FUNASR_NANO_INT8_DIR: &str =
-    "sherpa-onnx-sense-voice-funasr-nano-int8-2025-12-17";
+const SENSEVOICE_FUNASR_NANO_INT8_DIR: &str = "sherpa-onnx-sense-voice-funasr-nano-int8-2025-12-17";
 const SENSEVOICE_MODEL: &str = "model.onnx";
 const SENSEVOICE_MODEL_INT8: &str = "model.int8.onnx";
 const SENSEVOICE_TOKENS: &str = "tokens.txt";
@@ -81,19 +82,18 @@ impl SherpaAsrModel {
         }
 
         match key.as_str() {
-            "paraformer-zh-small"
-            | "paraformer-zh-small-2024-03-09" => Ok(Self::ParaformerZhSmall),
-            "paraformer-zh"
-            | "paraformer-zh-2024-03-09" => Ok(Self::ParaformerZh),
-            "paraformer-zh-int8"
-            | "paraformer-zh-int8-2025-10-07" => Ok(Self::ParaformerZhInt8),
-            "paraformer-trilingual"
-            | "paraformer-trilingual-zh-cantonese-en" => Ok(Self::ParaformerTrilingual),
-            "paraformer-en"
-            | "paraformer-en-2024-03-09" => Ok(Self::ParaformerEn),
+            "paraformer-zh-small" | "paraformer-zh-small-2024-03-09" => Ok(Self::ParaformerZhSmall),
+            "paraformer-zh" | "paraformer-zh-2024-03-09" => Ok(Self::ParaformerZh),
+            "paraformer-zh-int8" | "paraformer-zh-int8-2025-10-07" => Ok(Self::ParaformerZhInt8),
+            "paraformer-trilingual" | "paraformer-trilingual-zh-cantonese-en" => {
+                Ok(Self::ParaformerTrilingual)
+            }
+            "paraformer-en" | "paraformer-en-2024-03-09" => Ok(Self::ParaformerEn),
             "sensevoice" | "sense-voice" => Ok(Self::SenseVoice),
             "sensevoice-int8" | "sense-voice-int8" => Ok(Self::SenseVoiceInt8),
-            s if s.starts_with("sense-voice-") || s.starts_with("sensevoice-") => Ok(Self::SenseVoice),
+            s if s.starts_with("sense-voice-") || s.starts_with("sensevoice-") => {
+                Ok(Self::SenseVoice)
+            }
             other => bail!("Unknown ASR_MODEL: {other}"),
         }
     }
@@ -135,14 +135,15 @@ impl SherpaVadConfig {
         let min_silence_duration = env::get::<f32>("ASR_VAD_MIN_SILENCE")
             .unwrap_or(0.25)
             .max(0.05);
-        let min_speech_duration = env::get::<f32>("ASR_VAD_MIN_SPEECH").unwrap_or(0.1).max(0.0);
+        let min_speech_duration = env::get::<f32>("ASR_VAD_MIN_SPEECH")
+            .unwrap_or(0.1)
+            .max(0.0);
         let max_speech_duration = env::get::<f32>("ASR_VAD_MAX_SPEECH")
             .unwrap_or(30.0)
             .max(0.5);
         let threshold = env::f32_clamped("ASR_VAD_THRESHOLD", 0.5, 0.0, 1.0);
         let window_size = env::i32_clamped("ASR_VAD_WINDOW", 512, 128, 8192);
-        let buffer_size_in_seconds =
-            env::f32_clamped("ASR_VAD_BUFFER_SECONDS", 100.0, 1.0, 600.0);
+        let buffer_size_in_seconds = env::f32_clamped("ASR_VAD_BUFFER_SECONDS", 100.0, 1.0, 600.0);
 
         Ok(Self {
             model,
@@ -192,8 +193,7 @@ impl SherpaAsrConfig {
         let provider = env::string("ASR_PROVIDER").unwrap_or_else(|| DEFAULT_PROVIDER.to_string());
         let threads = env::i32_clamped("ASR_THREADS", DEFAULT_THREADS, 1, 32);
         let infer_log = env::bool01("ASR_INFER_LOG", false);
-        let segment_queue =
-            env::usize_clamped("ASR_SEGMENT_QUEUE", DEFAULT_SEGMENT_QUEUE, 1, 128);
+        let segment_queue = env::usize_clamped("ASR_SEGMENT_QUEUE", DEFAULT_SEGMENT_QUEUE, 1, 128);
         let vad_chunk_ms = env::u64_clamped("ASR_VAD_CHUNK_MS", 20, 5, 2000);
 
         let vad = SherpaVadConfig::from_env(&models_root)?;
@@ -214,16 +214,12 @@ impl SherpaAsrConfig {
 
     fn resolve_model_paths(&self) -> Result<(PathBuf, PathBuf)> {
         match self.model {
-            SherpaAsrModel::SenseVoice => resolve_sense_voice(
-                &self.models_root,
-                &[SENSEVOICE_DIR],
-                false,
-            ),
-            SherpaAsrModel::SenseVoiceInt8 => resolve_sense_voice(
-                &self.models_root,
-                &[SENSEVOICE_DIR],
-                true,
-            ),
+            SherpaAsrModel::SenseVoice => {
+                resolve_sense_voice(&self.models_root, &[SENSEVOICE_DIR], false)
+            }
+            SherpaAsrModel::SenseVoiceInt8 => {
+                resolve_sense_voice(&self.models_root, &[SENSEVOICE_DIR], true)
+            }
             SherpaAsrModel::SenseVoiceFunAsrNano => resolve_sense_voice(
                 &self.models_root,
                 &[SENSEVOICE_FUNASR_NANO_DIR, SENSEVOICE_FUNASR_NANO_INT8_DIR],
@@ -238,26 +234,26 @@ impl SherpaAsrConfig {
                 &self.models_root.join(PARAFORMER_ZH_SMALL_2024_03_09_DIR),
                 self.model_dtype,
             ),
-            SherpaAsrModel::ParaformerZh => {
-                resolve_paraformer_dir(
-                    &self.models_root.join(PARAFORMER_ZH_2024_03_09_DIR),
-                    self.model_dtype,
-                )
-            }
+            SherpaAsrModel::ParaformerZh => resolve_paraformer_dir(
+                &self.models_root.join(PARAFORMER_ZH_2024_03_09_DIR),
+                self.model_dtype,
+            ),
             SherpaAsrModel::ParaformerZhInt8 => resolve_paraformer_dir(
                 &self.models_root.join(PARAFORMER_ZH_INT8_2025_10_07_DIR),
                 self.model_dtype,
             ),
-            SherpaAsrModel::ParaformerTrilingual => {
-                resolve_paraformer_dir(&self.models_root.join(PARAFORMER_TRILINGUAL_DIR), self.model_dtype)
-            }
+            SherpaAsrModel::ParaformerTrilingual => resolve_paraformer_dir(
+                &self.models_root.join(PARAFORMER_TRILINGUAL_DIR),
+                self.model_dtype,
+            ),
             SherpaAsrModel::ParaformerEn => {
                 // voiceapi uses `sherpa-onnx-paraformer-en`, but the official archive uses
                 // `sherpa-onnx-paraformer-en-2024-03-09`. Try both for convenience.
-                let base = model_locator::first_existing_dir(&self.models_root, "ASR model dir", &[
-                    PARAFORMER_EN_DIR,
-                    PARAFORMER_EN_DIR_2024_03_09,
-                ])?;
+                let base = model_locator::first_existing_dir(
+                    &self.models_root,
+                    "ASR model dir",
+                    &[PARAFORMER_EN_DIR, PARAFORMER_EN_DIR_2024_03_09],
+                )?;
                 resolve_paraformer_dir(&base, self.model_dtype)
             }
         }
@@ -409,7 +405,11 @@ fn is_sense_voice_model(model: SherpaAsrModel) -> bool {
     )
 }
 
-fn init_recognizer(config: &SherpaAsrConfig, model_path: &Path, tokens_path: &Path) -> Result<SherpaRecognizer> {
+fn init_recognizer(
+    config: &SherpaAsrConfig,
+    model_path: &Path,
+    tokens_path: &Path,
+) -> Result<SherpaRecognizer> {
     if is_sense_voice_model(config.model) {
         init_sense_voice(config, model_path, tokens_path)
     } else {
@@ -417,7 +417,11 @@ fn init_recognizer(config: &SherpaAsrConfig, model_path: &Path, tokens_path: &Pa
     }
 }
 
-fn init_sense_voice(config: &SherpaAsrConfig, model_path: &Path, tokens_path: &Path) -> Result<SherpaRecognizer> {
+fn init_sense_voice(
+    config: &SherpaAsrConfig,
+    model_path: &Path,
+    tokens_path: &Path,
+) -> Result<SherpaRecognizer> {
     let recognizer = SenseVoiceRecognizer::new(SenseVoiceConfig {
         model: model_path.to_string_lossy().to_string(),
         tokens: tokens_path.to_string_lossy().to_string(),
@@ -431,7 +435,11 @@ fn init_sense_voice(config: &SherpaAsrConfig, model_path: &Path, tokens_path: &P
     Ok(SherpaRecognizer::SenseVoice(recognizer))
 }
 
-fn init_paraformer(config: &SherpaAsrConfig, model_path: &Path, tokens_path: &Path) -> Result<SherpaRecognizer> {
+fn init_paraformer(
+    config: &SherpaAsrConfig,
+    model_path: &Path,
+    tokens_path: &Path,
+) -> Result<SherpaRecognizer> {
     let recognizer = ParaformerRecognizer::new(ParaformerConfig {
         model: model_path.to_string_lossy().to_string(),
         tokens: tokens_path.to_string_lossy().to_string(),
@@ -447,9 +455,12 @@ fn init_paraformer(config: &SherpaAsrConfig, model_path: &Path, tokens_path: &Pa
 ///
 /// - `write_*` accepts PCM audio and pushes to an internal queue.
 /// - `read()` returns recognized segments as they become available.
+/// - `try_read_vad_event()` returns VAD events (SpeechStart/SpeechEnd).
 pub struct SherpaAsrStream {
     tx: mpsc::Sender<InputMsg>,
     rx: mpsc::Receiver<AsrSegment>,
+    vad_rx: mpsc::Receiver<VadEvent>,
+    vad_state: Arc<RwLock<VadState>>,
     input_format: Option<InputFormat>,
     resampler: Option<LinearResampler>,
     join: Option<tokio::task::JoinHandle<()>>,
@@ -485,16 +496,30 @@ impl SherpaAsrStream {
         let vad_chunk_samples = ((TARGET_SAMPLE_RATE as u64 * vad_chunk_ms) / 1000).max(1) as usize;
 
         // Use std::sync::mpsc for thread-safe communication with VAD blocking thread
-        let (vad_tx, vad_rx) = std::sync::mpsc::channel::<VadInputMsg>();
+        let (vad_input_tx, vad_input_rx) = std::sync::mpsc::channel::<VadInputMsg>();
+
+        // VAD event channel for external consumption
+        let (vad_event_tx, vad_event_rx) = mpsc::channel::<VadEvent>(64);
+
+        // Shared VAD state for polling
+        let vad_state = Arc::new(RwLock::new(VadState::default()));
+        let vad_state_for_struct = vad_state.clone();
 
         let join = tokio::spawn(async move {
-
             let (segment_tx, segment_rx) = mpsc::channel::<VadSegment>(segment_queue);
 
             // VAD processing now runs in spawn_blocking to avoid blocking the reactor
             // P0.5 fix: vad.accept_waveform() is synchronous ONNX inference
+            let vad_state_clone = vad_state.clone();
             let vad_handle = tokio::task::spawn_blocking(move || {
-                run_vad_loop(vad, vad_rx, segment_tx, vad_chunk_samples);
+                run_vad_loop(
+                    vad,
+                    vad_input_rx,
+                    segment_tx,
+                    vad_event_tx,
+                    vad_state_clone,
+                    vad_chunk_samples,
+                );
             });
 
             let infer_handle = tokio::task::spawn_blocking(move || {
@@ -508,18 +533,18 @@ impl SherpaAsrStream {
                         if samples.is_empty() {
                             continue;
                         }
-                        if vad_tx.send(VadInputMsg::Samples(samples)).is_err() {
+                        if vad_input_tx.send(VadInputMsg::Samples(samples)).is_err() {
                             break;
                         }
                     }
                     InputMsg::End => {
-                        let _ = vad_tx.send(VadInputMsg::End);
+                        let _ = vad_input_tx.send(VadInputMsg::End);
                         break;
                     }
                 }
             }
 
-            drop(vad_tx);
+            drop(vad_input_tx);
             let _ = vad_handle.await;
             let _ = infer_handle.await;
         });
@@ -528,6 +553,8 @@ impl SherpaAsrStream {
         Ok(Self {
             tx,
             rx,
+            vad_rx: vad_event_rx,
+            vad_state: vad_state_for_struct,
             input_format: None,
             resampler: None,
             join: Some(join),
@@ -603,12 +630,37 @@ impl SherpaAsrStream {
         }
     }
 
+    /// 尝试读取 VAD 事件（非阻塞，需 while-let drain）。
+    ///
+    /// 调用方应在每次 tick 中 drain 所有事件，否则：
+    /// - VAD 线程会被 `blocking_send` 阻塞，导致整条 ASR 链路停滞
+    /// - 边沿事件不会丢失，但会延迟到达
+    ///
+    /// ```ignore
+    /// while let Some(event) = asr.try_read_vad_event() {
+    ///     detector.push_vad(event, &mut events);
+    /// }
+    /// ```
+    pub fn try_read_vad_event(&mut self) -> Option<VadEvent> {
+        match self.vad_rx.try_recv() {
+            Ok(event) => Some(event),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => None,
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => None,
+        }
+    }
+
+    /// 获取当前 VAD 状态快照（用于状态查询/静音累计）。
+    pub fn vad_state(&self) -> VadState {
+        self.vad_state.read().map(|s| s.clone()).unwrap_or_default()
+    }
+
     pub async fn finish(&mut self) -> Result<()> {
         let _ = self.tx.send(InputMsg::End).await;
         let Some(join) = self.join.take() else {
             return Ok(());
         };
-        join.await.map_err(|e| anyhow!("asr task join failed: {e}"))?;
+        join.await
+            .map_err(|e| anyhow!("asr task join failed: {e}"))?;
         Ok(())
     }
 
@@ -637,12 +689,19 @@ struct VadSegment {
 /// This function processes audio samples through Silero VAD and sends
 /// detected speech segments to the ASR inference thread. Running in
 /// spawn_blocking prevents ONNX inference from blocking the tokio reactor.
+///
+/// Also emits VadEvent (SpeechStart/SpeechEnd) for external consumption.
 fn run_vad_loop(
     mut vad: SileroVad,
     vad_rx: std::sync::mpsc::Receiver<VadInputMsg>,
     segment_tx: mpsc::Sender<VadSegment>,
+    vad_event_tx: mpsc::Sender<VadEvent>,
+    vad_state: Arc<RwLock<VadState>>,
     vad_chunk_samples: usize,
 ) {
+    let mut was_speaking = false;
+    let mut speech_start_ts: Option<Instant> = None;
+
     while let Ok(msg) = vad_rx.recv() {
         match msg {
             VadInputMsg::Samples(samples) => {
@@ -652,6 +711,48 @@ fn run_vad_loop(
                 for chunk in samples.chunks(vad_chunk_samples) {
                     // This is the key ONNX inference call that was blocking the reactor
                     vad.accept_waveform(chunk);
+
+                    // Check for speech state transitions.
+                    // 只用 vad.is_speech() 作为语音活动判定标准，避免队列状态引入不确定性。
+                    let is_speaking = vad.is_speech();
+                    let now = Instant::now();
+
+                    if is_speaking && !was_speaking {
+                        // Speech started
+                        speech_start_ts = Some(now);
+                        let event = VadEvent::SpeechStart { ts: now };
+                        let _ = vad_event_tx.blocking_send(event);
+
+                        // Update shared state
+                        if let Ok(mut state) = vad_state.write() {
+                            state.speaking = true;
+                            state.last_change_ts = now;
+                            state.seq += 1;
+                        }
+                        was_speaking = true;
+                    }
+
+                    if was_speaking && !is_speaking {
+                        // Speech ended
+                        let duration_ms = speech_start_ts
+                            .map(|start| now.saturating_duration_since(start).as_millis() as u32)
+                            .unwrap_or(0);
+                        let event = VadEvent::SpeechEnd {
+                            ts: now,
+                            duration_ms,
+                        };
+                        let _ = vad_event_tx.blocking_send(event);
+
+                        // Update shared state
+                        if let Ok(mut state) = vad_state.write() {
+                            state.speaking = false;
+                            state.last_change_ts = now;
+                            state.seq += 1;
+                        }
+                        was_speaking = false;
+                        speech_start_ts = None;
+                    }
+
                     if enqueue_vad_segments_blocking(&mut vad, &segment_tx) {
                         return;
                     }
@@ -660,6 +761,25 @@ fn run_vad_loop(
             VadInputMsg::End => {
                 vad.flush();
                 let _ = enqueue_vad_segments_blocking(&mut vad, &segment_tx);
+
+                // Emit final SpeechEnd if still speaking
+                if was_speaking {
+                    let now = Instant::now();
+                    let duration_ms = speech_start_ts
+                        .map(|start| now.saturating_duration_since(start).as_millis() as u32)
+                        .unwrap_or(0);
+                    let event = VadEvent::SpeechEnd {
+                        ts: now,
+                        duration_ms,
+                    };
+                    let _ = vad_event_tx.blocking_send(event);
+
+                    if let Ok(mut state) = vad_state.write() {
+                        state.speaking = false;
+                        state.last_change_ts = now;
+                        state.seq += 1;
+                    }
+                }
                 break;
             }
         }
