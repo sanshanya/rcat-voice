@@ -164,7 +164,7 @@ impl RemoteTtsInner {
                 continue;
             }
 
-            tracing::info!(
+            tracing::debug!(
                 "RemoteTts: HTTP chunk {} bytes -> {} samples ({:.1}ms)",
                 chunk.len(),
                 sample_buf.len(),

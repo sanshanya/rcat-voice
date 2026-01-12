@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tracing::{info, warn};
 
-use crate::internal::{env, model_locator, timing};
+use crate::internal::{env, model_locator, models, timing};
 
 // 首段之后的默认流式分块 token 目标（逐步增大以提升连贯性/吞吐）：
 // 25：第二段初始块，更快出声
@@ -289,7 +289,10 @@ impl GptSovitsConfig {
     }
 
     pub fn from_env() -> Result<Self> {
-        let base_dir = env::string("GSV_MODEL_DIR").unwrap_or_else(|| DEFAULT_BASE_DIR.to_string());
+        let base_dir = env::string("GSV_MODEL_DIR")
+            .map(PathBuf::from)
+            .or_else(models::tts_gpt_sovits_dir)
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_BASE_DIR));
         let mut cfg = Self::from_dir(base_dir)?;
         cfg.apply_env_overrides();
         Ok(cfg)

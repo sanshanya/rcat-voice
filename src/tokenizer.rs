@@ -4,6 +4,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 
 use crate::internal::env;
+use crate::metrics::{MetricEvent, MetricEventKind, MetricsSink, default_sink};
 
 const THRESHOLD_MAX_CHARS: usize = 400;
 
@@ -52,6 +53,10 @@ impl FlushThresholds {
 #[derive(Debug, Clone)]
 /// 发送到 TTS 管线的文本片段（含时间戳）。
 pub struct Segment {
+    /// Turn ID（用于将日志/metrics 与单轮对话绑定）。
+    ///
+    /// 约定：0 表示“未知/未绑定”。
+    pub turn_id: u64,
     /// 片段文本内容。
     pub text: String,
     /// LLM 请求起点时间戳（t0）。若未显式标记，则为会话创建时间。
@@ -110,6 +115,8 @@ pub struct Tokenizer {
     buffer_ms_rx: watch::Receiver<u64>,
     session_start_ts: Instant, // t0 fallback
     llm_start: Arc<OnceLock<Instant>>,
+    turn_id: u64,
+    metrics: Arc<dyn MetricsSink>,
     config: TokenizerConfig,
 }
 
@@ -120,6 +127,7 @@ impl Tokenizer {
         buffer_ms_rx: watch::Receiver<u64>,
         session_start_ts: Instant,
         llm_start: Arc<OnceLock<Instant>>,
+        turn_id: u64,
         config: TokenizerConfig,
     ) -> Self {
         Self {
@@ -128,6 +136,30 @@ impl Tokenizer {
             buffer_ms_rx,
             session_start_ts,
             llm_start,
+            turn_id,
+            metrics: default_sink(),
+            config: config.normalize(),
+        }
+    }
+
+    pub fn new_with_metrics(
+        delta_rx: mpsc::Receiver<String>,
+        chunk_tx: mpsc::Sender<Segment>,
+        buffer_ms_rx: watch::Receiver<u64>,
+        session_start_ts: Instant,
+        llm_start: Arc<OnceLock<Instant>>,
+        turn_id: u64,
+        metrics: Arc<dyn MetricsSink>,
+        config: TokenizerConfig,
+    ) -> Self {
+        Self {
+            delta_rx,
+            chunk_tx,
+            buffer_ms_rx,
+            session_start_ts,
+            llm_start,
+            turn_id,
+            metrics,
             config: config.normalize(),
         }
     }
@@ -138,6 +170,7 @@ impl Tokenizer {
         buffer_ms_rx: watch::Receiver<u64>,
         session_start_ts: Instant,
         llm_start: Arc<OnceLock<Instant>>,
+        turn_id: u64,
     ) -> Self {
         Self::new(
             delta_rx,
@@ -145,6 +178,7 @@ impl Tokenizer {
             buffer_ms_rx,
             session_start_ts,
             llm_start,
+            turn_id,
             TokenizerConfig::from_env(),
         )
     }
@@ -170,6 +204,7 @@ impl Tokenizer {
             .copied()
             .unwrap_or(self.session_start_ts);
         let chunk = Segment {
+            turn_id: self.turn_id,
             text,
             llm_start_ts,
             first_token_ts: if *first { first_delta_ts } else { None },
@@ -192,6 +227,7 @@ impl Tokenizer {
         let mut first = true;
         let mut first_delta_ts: Option<Instant> = None;
         let mut last_delta_ts: Option<Instant> = None;
+        let mut llm_first_token_emitted = false;
         let mut eager_chunks_remaining = self.config.eager_chunks;
 
         let relax_buffer_ms = self.config.relax_buffer_ms;
@@ -202,11 +238,23 @@ impl Tokenizer {
                 maybe = self.delta_rx.recv() => {
                     let is_eof = maybe.is_none();
                     if let Some(delta) = maybe {
-                        // Capture time of first token
-                        if first && first_delta_ts.is_none() {
-                            first_delta_ts = Some(Instant::now());
+                        let now = Instant::now();
+
+                        // Capture time of first (non-empty) token.
+                        if first_delta_ts.is_none() && !delta.is_empty() {
+                            first_delta_ts = Some(now);
+                            if !llm_first_token_emitted {
+                                self.metrics.on_event(MetricEvent {
+                                    turn_id: self.turn_id,
+                                    kind: MetricEventKind::LlmFirstToken,
+                                    ts: now,
+                                });
+                                llm_first_token_emitted = true;
+                            }
                         }
-                        last_delta_ts = Some(Instant::now());
+                        if !delta.is_empty() {
+                            last_delta_ts = Some(now);
+                        }
 
                         buf.push_str(&delta);
                     }
@@ -301,12 +349,7 @@ fn log_relax_transition(
     }
 }
 
-fn find_flush_index(
-    s: &str,
-    min_chars: usize,
-    soft_max: usize,
-    hard_max: usize,
-) -> Option<usize> {
+fn find_flush_index(s: &str, min_chars: usize, soft_max: usize, hard_max: usize) -> Option<usize> {
     let scan = scan_boundaries(s, hard_max);
     let count = scan.total_chars;
 
@@ -458,7 +501,7 @@ mod tests {
         let s = "Hello👍";
         assert_eq!(s.chars().count(), 6);
         assert_eq!(s.len(), 9);
-        
+
         // No boundary - should not flush until hard limit
         let idx = find_flush_index(s, 1, 5, 10);
         assert_eq!(idx, None); // Below hard_max, no boundary
@@ -471,7 +514,7 @@ mod tests {
         let s = "Hi你好！";
         assert_eq!(s.chars().count(), 5);
         assert_eq!(s.len(), 11);
-        
+
         let idx = find_flush_index(s, 1, 10, 20);
         // ！ is strong boundary at end
         assert_eq!(idx, Some(s.len())); // 11 bytes
@@ -483,7 +526,7 @@ mod tests {
         let s = "一二三四五六七八九十";
         assert_eq!(s.chars().count(), 10);
         assert_eq!(s.len(), 30);
-        
+
         // hard_max=8 chars → should cut at char boundary (8*3=24 bytes)
         let idx = find_flush_index(s, 1, 5, 8);
         // hard_cut should return byte index of 8th char end
@@ -505,6 +548,7 @@ mod tests {
             buffer_rx,
             session_start_ts,
             llm_start,
+            123,
             TokenizerConfig {
                 eager_chunks: 0,
                 relax_buffer_ms: 0,

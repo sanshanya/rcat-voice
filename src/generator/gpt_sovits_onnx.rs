@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use tokio::time::Instant;
 use tracing::info;
 
-use crate::internal::{env, model_locator};
+use crate::internal::{env, model_locator, models, ort_log};
 
 const DEFAULT_MODEL_DIR: &str = "onnx";
 const DEFAULT_EXPORT_NAME: &str = "custom";
@@ -87,8 +87,10 @@ impl GptSovitsOnnxConfig {
     }
 
     pub fn from_env() -> Result<Self> {
-        let model_dir =
-            env::string("GSV_ONNX_MODEL_DIR").unwrap_or_else(|| DEFAULT_MODEL_DIR.to_string());
+        let model_dir = env::string("GSV_ONNX_MODEL_DIR")
+            .map(PathBuf::from)
+            .or_else(models::tts_gpt_sovits_onnx_dir)
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_MODEL_DIR));
         let export_name =
             env::string("GSV_ONNX_EXPORT_NAME").unwrap_or_else(|| DEFAULT_EXPORT_NAME.to_string());
 
@@ -110,7 +112,7 @@ impl GptSovitsOnnxConfig {
             env::usize_clamped("GSV_ONNX_CHUNK_SAMPLES", DEFAULT_CHUNK_SAMPLES, 256, 16384);
 
         Ok(Self {
-            model_dir: PathBuf::from(model_dir),
+            model_dir,
             export_name,
             bert_path,
             g2pw_path,
@@ -150,6 +152,8 @@ impl GptSovitsOnnxTts {
     }
 
     pub fn from_config(config: GptSovitsOnnxConfig, audio: Arc<dyn AudioBackend>) -> Result<Self> {
+        ort_log::apply_from_env();
+
         let base_dir = config.model_dir;
         if !base_dir.is_dir() {
             return Err(anyhow!(

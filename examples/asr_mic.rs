@@ -1,9 +1,11 @@
 #[cfg(all(feature = "asr-sherpa", feature = "asr-mic"))]
 use anyhow::{Context, Result, bail};
 #[cfg(all(feature = "asr-sherpa", feature = "asr-mic"))]
-use std::sync::Arc;
+use rcat_voice::metrics::{MetricsSink, TracingMetricsSink};
 #[cfg(all(feature = "asr-sherpa", feature = "asr-mic", feature = "turn-smart"))]
-use rcat_voice::turn::SmartTurnDetector;
+use rcat_voice::turn::{SmartTurnConfig, SmartTurnDetector};
+#[cfg(all(feature = "asr-sherpa", feature = "asr-mic"))]
+use std::sync::Arc;
 
 #[cfg(not(feature = "asr-sherpa"))]
 fn main() {
@@ -67,7 +69,11 @@ async fn main() -> Result<()> {
     let sample_rate = config.sample_rate.0;
     let channels = config.channels;
     if sample_rate == 0 || channels == 0 {
-        bail!("Invalid input audio format: {}Hz/{}ch", sample_rate, channels);
+        bail!(
+            "Invalid input audio format: {}Hz/{}ch",
+            sample_rate,
+            channels
+        );
     }
 
     let ring_capacity = (sample_rate as usize)
@@ -78,23 +84,24 @@ async fn main() -> Result<()> {
     let queue: Arc<ArrayQueue<i16>> = Arc::new(ArrayQueue::new(ring_capacity));
     let dropped = Arc::new(AtomicU64::new(0));
 
-    let stream = build_cpal_stream(&device, &config, sample_format, queue.clone(), dropped.clone())
-        .context("failed to build input stream")?;
+    let stream = build_cpal_stream(
+        &device,
+        &config,
+        sample_format,
+        queue.clone(),
+        dropped.clone(),
+    )
+    .context("failed to build input stream")?;
     stream.play().context("failed to start input stream")?;
 
     info!(
         "asr_mic: device={} format={:?} input={}Hz/{}ch feed_ms={} ring={}s cap_samples={}",
-        device_name,
-        sample_format,
-        sample_rate,
-        channels,
-        feed_ms,
-        ring_seconds,
-        ring_capacity
+        device_name, sample_format, sample_rate, channels, feed_ms, ring_seconds, ring_capacity
     );
     info!("asr_mic: press Ctrl+C to stop");
 
-    let mut asr = rcat_voice::asr::SherpaAsrStream::from_env()?;
+    let metrics: Arc<dyn MetricsSink> = Arc::new(TracingMetricsSink::from_env());
+    let mut asr = rcat_voice::asr::SherpaAsrStream::from_env_with_metrics(metrics)?;
     let mut turn_text = String::new();
 
     #[cfg(feature = "turn-smart")]
@@ -133,25 +140,41 @@ async fn main() -> Result<()> {
         .clamp(0, 20_000);
 
     #[cfg(feature = "turn-smart")]
-    let mut smart_turn: Option<SmartTurnDetector> = match std::env::var("SMART_TURN_MODEL") {
-        Ok(value) if !value.trim().is_empty() => {
-            let detector = SmartTurnDetector::from_env()?;
-            info!(
-                "asr_mic: smart_turn enabled (threshold={:.2}, model={})",
-                detector.threshold(),
-                value
-            );
-            info!(
-                "asr_mic: smart_turn gate: min_silence_ms={} commit_ms={} force_end_ms={} eval_interval_ms={} silence_abs={}",
-                turn_min_silence_ms,
-                turn_commit_ms,
-                turn_force_end_ms,
-                turn_eval_interval_ms,
-                turn_silence_abs,
-            );
-            Some(detector)
+    let mut smart_turn: Option<SmartTurnDetector> = {
+        let env_has = |key: &str| std::env::var(key).ok().is_some_and(|v| !v.trim().is_empty());
+        let smart_turn_disabled = std::env::var("SMART_TURN_DISABLE").ok().is_some_and(|v| {
+            matches!(
+                v.trim().to_lowercase().as_str(),
+                "1" | "true" | "yes" | "y" | "on"
+            )
+        });
+        let smart_turn_enabled =
+            !smart_turn_disabled && (env_has("SMART_TURN_MODEL") || env_has("RCAT_MODELS_DIR"));
+        if !smart_turn_enabled {
+            None
+        } else {
+            match SmartTurnConfig::from_env().and_then(SmartTurnDetector::new) {
+                Ok(detector) => {
+                    info!(
+                        "asr_mic: smart_turn enabled (threshold={:.2})",
+                        detector.threshold()
+                    );
+                    info!(
+                        "asr_mic: smart_turn gate: min_silence_ms={} commit_ms={} force_end_ms={} eval_interval_ms={} silence_abs={}",
+                        turn_min_silence_ms,
+                        turn_commit_ms,
+                        turn_force_end_ms,
+                        turn_eval_interval_ms,
+                        turn_silence_abs,
+                    );
+                    Some(detector)
+                }
+                Err(err) => {
+                    warn!("asr_mic: smart_turn disabled: {err}");
+                    None
+                }
+            }
         }
-        _ => None,
     };
 
     #[cfg(feature = "turn-smart")]
@@ -344,10 +367,7 @@ fn select_input_device(host: &cpal::Host, hint: Option<String>) -> Result<cpal::
         devices.push((name, device));
     }
 
-    if let Some(hint) = hint
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-    {
+    if let Some(hint) = hint.map(|v| v.trim().to_string()).filter(|v| !v.is_empty()) {
         let needle = hint.to_lowercase();
         if let Some(index) = devices
             .iter()
@@ -360,9 +380,7 @@ fn select_input_device(host: &cpal::Host, hint: Option<String>) -> Result<cpal::
             .map(|(name, _)| format!("- {name}"))
             .collect::<Vec<_>>()
             .join("\n");
-        bail!(
-            "ASR_MIC_DEVICE={hint} did not match any input device. Available:\n{available}"
-        );
+        bail!("ASR_MIC_DEVICE={hint} did not match any input device. Available:\n{available}");
     }
 
     host.default_input_device()

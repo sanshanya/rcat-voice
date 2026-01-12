@@ -1,7 +1,7 @@
 use anyhow::Result;
-use rcat_voice::tokenizer::{Segment, Tokenizer, TokenizerConfig};
 use rcat_voice::generator::TtsEngine;
 use rcat_voice::pipeline::{Pipeline, PipelineConfig};
+use rcat_voice::tokenizer::{Segment, Tokenizer, TokenizerConfig};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,12 +27,7 @@ async fn main() -> Result<()> {
     let cancelled = Arc::new(AtomicBool::new(false));
     for round in 1..=rounds {
         info!("=== LLM round {}/{} ===", round, rounds);
-        let was_cancelled = run_round(
-            round,
-            tts_engine.clone(),
-            cancelled.clone(),
-        )
-        .await?;
+        let was_cancelled = run_round(round, tts_engine.clone(), cancelled.clone()).await?;
         if was_cancelled {
             info!("Cancel requested; continuing to next round.");
         }
@@ -106,11 +101,7 @@ async fn run_round(
     });
 
     // Task 1: Player (Consumer of Segments)
-    let pipeline = Pipeline::new(
-        chunk_rx,
-        tts_engine.clone(),
-        PipelineConfig::from_env(),
-    );
+    let pipeline = Pipeline::new(chunk_rx, tts_engine.clone(), PipelineConfig::from_env());
     let pipeline_handle = tokio::spawn(pipeline.run());
 
     // Task 2: Tokenizer (Consumer of Deltas, Producer of Segments)
@@ -120,14 +111,14 @@ async fn run_round(
         buffer_rx,
         session_start_ts,
         llm_start.clone(),
+        round as u64,
         TokenizerConfig::from_env(),
     );
     let tokenizer_handle = tokio::spawn(tokenizer.run());
 
     // Task 3: Simulated LLM stream (Producer of Deltas)
-    let simulated_text = std::env::var("LLM_SIM_TEXT").unwrap_or_else(|_| {
-        "请用两三句话解释为什么首段短、后续段长更适合流式TTS。".to_string()
-    });
+    let simulated_text = std::env::var("LLM_SIM_TEXT")
+        .unwrap_or_else(|_| "请用两三句话解释为什么首段短、后续段长更适合流式TTS。".to_string());
     let chunk_chars = std::env::var("LLM_SIM_CHUNK_CHARS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())

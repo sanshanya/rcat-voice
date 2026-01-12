@@ -34,8 +34,8 @@ AI 会根据映射表定位代码并提供修改方案。
 | 功能 | 别名 | 代码位置 | 配置 |
 |------|------|---------|------|
 | TTS 引擎接口 | 语音合成, speak | `src/generator/mod.rs` | `TTS_BACKEND` |
-| GPT-SoVITS CUDA | 克隆语音, AI声音 | `src/generator/gpt_sovits.rs` | `GSV_MODEL_DIR` |
-| GPT-SoVITS ONNX | CPU语音合成 | `src/generator/gpt_sovits_onnx.rs` | `GSV_ONNX_MODEL_DIR` |
+| GPT-SoVITS CUDA | 克隆语音, AI声音 | `src/generator/gpt_sovits.rs` | `RCAT_MODELS_DIR`（推荐）/ `GSV_MODEL_DIR`（覆盖） |
+| GPT-SoVITS ONNX | CPU语音合成 | `src/generator/gpt_sovits_onnx.rs` | `RCAT_MODELS_DIR`（推荐）/ `GSV_ONNX_MODEL_DIR`（覆盖） |
 | OS TTS | 系统语音, SAPI | `src/generator/os.rs` | - |
 | Remote TTS | 远程语音, HTTP | `src/generator/remote.rs` | `TTS_REMOTE_BASE_URL` |
 
@@ -81,7 +81,7 @@ $env:TTS_BACKEND = "gpt-sovits-onnx"  # 或 gpt-sovits / os / remote
 | 功能 | 别名 | 代码位置 | 配置 |
 |------|------|---------|------|
 | ASR 接口 | 语音识别, STT | `src/asr/mod.rs` | `ASR_MODEL` |
-| Sherpa 实现 | ONNX推理 | `src/asr/sherpa.rs` | `ASR_MODELS_ROOT` |
+| Sherpa 实现 | ONNX推理 | `src/asr/sherpa.rs` | `RCAT_MODELS_DIR`（推荐）/ `ASR_MODELS_ROOT`（覆盖） |
 | VAD 配置 | 语音活动 | `SherpaVadConfig` | `ASR_VAD_THRESHOLD` |
 
 ### 常用操作
@@ -99,7 +99,7 @@ $env:ASR_MODEL = "funasr-nano-int8"  # 推荐
 
 | 功能 | 别名 | 代码位置 | 配置 |
 |------|------|---------|------|
-| Smart Turn | 端点概率, turn end | `src/turn/smart_turn.rs` | `SMART_TURN_MODEL` |
+| Smart Turn | 端点概率, turn end | `src/turn/smart_turn.rs` | `RCAT_MODELS_DIR`（推荐）/ `SMART_TURN_MODEL`（覆盖） |
 | 阈值配置 | 灵敏度 | `SmartTurnDetector` | `SMART_TURN_THRESHOLD` |
 
 ---
@@ -143,7 +143,7 @@ $env:BARGE_IN_MIN_SPEECH_MS = "600"   # 增大触发时长
 
 | 功能 | 别名 | 代码位置 | 配置 |
 |------|------|---------|------|
-| 管道调度 | Pipeline | `src/pipeline.rs` | `TTS_PARALLEL` |
+| 管道调度 | Pipeline | `src/pipeline.rs` | `TTS_PARALLEL_SYNTH` |
 | 并行合成 | run_parallel | `Pipeline.run_parallel()` | `TTS_SYNTH_INFLIGHT` |
 
 ---
@@ -172,8 +172,8 @@ $env:TOKENIZER_NORMAL_SOFT_MAX_CHARS = "30"
 
 | 功能 | 别名 | 代码位置 | 配置 |
 |------|------|---------|------|
-| 轮次延迟 | turn_to_finish | `voice_assistant.rs:319` | 日志输出 |
 | Ring 指标 | 缓冲阻塞 | `rodio.rs:406-407` | `AUDIO_RING_METRICS=1` |
+| 流式指标 | LLM/TTS 推导指标 | `src/metrics.rs` | `VOICE_STREAM_METRICS=1` |
 | TTS 指标 | 时间线 | `TtsMetrics` | `VOICE_TTS_METRICS=1` |
 
 ---
@@ -193,5 +193,5 @@ $env:TOKENIZER_NORMAL_SOFT_MAX_CHARS = "30"
 
 - [README.md](./README.md) - 文档索引
 - [ARCHITECTURE.md](./ARCHITECTURE.md) - 系统架构
-- [OPTIMIZATIONS.md](./OPTIMIZATIONS.md) - 优化建议
 - [TROUBLESHOOTING.md](./TROUBLESHOOTING.md) - 故障排查
+

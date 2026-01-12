@@ -1,5 +1,6 @@
 use crate::generator::TtsEngine;
 use crate::internal::env;
+use crate::metrics::{MetricEvent, MetricEventKind, MetricsSink, default_sink};
 use crate::pipeline::{Pipeline, PipelineConfig};
 use crate::tokenizer::{Segment, Tokenizer, TokenizerConfig};
 use anyhow::Result;
@@ -100,6 +101,8 @@ pub struct StreamSessionBuilder {
     stream: StreamConfig,
     tokenizer: TokenizerConfig,
     pipeline: PipelineConfig,
+    turn_id: u64,
+    metrics: Arc<dyn MetricsSink>,
 }
 
 impl StreamSessionBuilder {
@@ -109,6 +112,8 @@ impl StreamSessionBuilder {
             stream: StreamConfig::default(),
             tokenizer: TokenizerConfig::default(),
             pipeline: PipelineConfig::default(),
+            turn_id: 0,
+            metrics: default_sink(),
         }
     }
 
@@ -118,6 +123,8 @@ impl StreamSessionBuilder {
             stream: StreamConfig::from_env(),
             tokenizer: TokenizerConfig::from_env(),
             pipeline: PipelineConfig::from_env(),
+            turn_id: 0,
+            metrics: default_sink(),
         }
     }
 
@@ -136,8 +143,29 @@ impl StreamSessionBuilder {
         self
     }
 
+    /// Set a metrics sink for this session.
+    pub fn metrics_sink(mut self, metrics: Arc<dyn MetricsSink>) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
+    /// Bind a `turn_id` to all segments produced by this session.
+    ///
+    /// Convention: `0` means "unknown/unbound".
+    pub fn turn_id(mut self, turn_id: u64) -> Self {
+        self.turn_id = turn_id;
+        self
+    }
+
     pub fn build(self) -> StreamSession {
-        StreamSession::new_with_configs(self.tts_engine, self.stream, self.tokenizer, self.pipeline)
+        StreamSession::new_with_configs(
+            self.tts_engine,
+            self.stream,
+            self.tokenizer,
+            self.pipeline,
+            self.turn_id,
+            self.metrics,
+        )
     }
 }
 
@@ -147,6 +175,8 @@ pub struct StreamControl {
     delta_tx: mpsc::Sender<String>,
     cancel: SessionCancel,
     llm_start: Arc<OnceLock<Instant>>,
+    turn_id: u64,
+    metrics: Arc<dyn MetricsSink>,
 }
 
 impl StreamControl {
@@ -165,7 +195,14 @@ impl StreamControl {
 
     /// 标记 LLM 请求开始时间，用于指标统计。
     pub fn mark_llm_start(&self) {
-        let _ = self.llm_start.get_or_init(Instant::now);
+        let ts = Instant::now();
+        if self.llm_start.set(ts).is_ok() {
+            self.metrics.on_event(MetricEvent {
+                turn_id: self.turn_id,
+                kind: MetricEventKind::LlmStart,
+                ts,
+            });
+        }
     }
 
     /// 打断当前轮次：停止播放并清空已排队音频（不可恢复）。
@@ -194,12 +231,21 @@ impl StreamControl {
 pub struct StreamCancelHandle {
     cancel: SessionCancel,
     llm_start: Arc<OnceLock<Instant>>,
+    turn_id: u64,
+    metrics: Arc<dyn MetricsSink>,
 }
 
 impl StreamCancelHandle {
     /// 标记 LLM 请求开始时间，用于指标统计。
     pub fn mark_llm_start(&self) {
-        let _ = self.llm_start.get_or_init(Instant::now);
+        let ts = Instant::now();
+        if self.llm_start.set(ts).is_ok() {
+            self.metrics.on_event(MetricEvent {
+                turn_id: self.turn_id,
+                kind: MetricEventKind::LlmStart,
+                ts,
+            });
+        }
     }
 
     /// 打断当前轮次：停止播放并清空已排队音频（不可恢复）。
@@ -252,6 +298,8 @@ impl StreamSession {
         stream_config: StreamConfig,
         tokenizer_config: TokenizerConfig,
         pipeline_config: PipelineConfig,
+        turn_id: u64,
+        metrics: Arc<dyn MetricsSink>,
     ) -> Self {
         let session_start_ts = Instant::now();
         let llm_start = Arc::new(OnceLock::new());
@@ -277,20 +325,23 @@ impl StreamSession {
             }
         });
 
-        let pipeline = Pipeline::new(
+        let pipeline = Pipeline::new_with_metrics(
             chunk_rx,
             tts_engine.clone(),
             pipeline_config,
+            metrics.clone(),
         );
         let pipeline_handle = tokio::spawn(pipeline.run());
         let pipeline_abort = pipeline_handle.abort_handle();
 
-        let tokenizer = Tokenizer::new(
+        let tokenizer = Tokenizer::new_with_metrics(
             delta_rx,
             chunk_tx,
             buffer_rx,
             session_start_ts,
             llm_start.clone(),
+            turn_id,
+            metrics.clone(),
             tokenizer_config,
         );
         let tokenizer_handle = tokio::spawn(tokenizer.run());
@@ -306,6 +357,8 @@ impl StreamSession {
             delta_tx,
             cancel,
             llm_start,
+            turn_id,
+            metrics,
         };
 
         Self {
@@ -324,6 +377,8 @@ impl StreamSession {
         StreamCancelHandle {
             cancel: self.control.cancel.clone(),
             llm_start: self.control.llm_start.clone(),
+            turn_id: self.control.turn_id,
+            metrics: self.control.metrics.clone(),
         }
     }
 

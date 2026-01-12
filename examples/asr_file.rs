@@ -2,6 +2,11 @@
 use anyhow::{Context, Result, bail};
 
 #[cfg(feature = "asr-sherpa")]
+use rcat_voice::metrics::{MetricsSink, TracingMetricsSink};
+#[cfg(feature = "asr-sherpa")]
+use std::sync::Arc;
+
+#[cfg(feature = "asr-sherpa")]
 use tracing_subscriber::EnvFilter;
 
 #[cfg(not(feature = "asr-sherpa"))]
@@ -34,7 +39,8 @@ async fn main() -> Result<()> {
         .min(2000);
 
     let init_start = std::time::Instant::now();
-    let mut stream = rcat_voice::asr::SherpaAsrStream::from_env()?;
+    let sink: Arc<dyn MetricsSink> = Arc::new(TracingMetricsSink::from_env());
+    let mut stream = rcat_voice::asr::SherpaAsrStream::from_env_with_metrics(sink)?;
     let init_ms = init_start.elapsed().as_millis() as u64;
 
     if metrics {
@@ -60,9 +66,7 @@ async fn main() -> Result<()> {
     let mut max_lag_ms: f64 = 0.0;
 
     for chunk in pcm.chunks(chunk_samples) {
-        stream
-            .write_pcm_i16(chunk, sample_rate, channels)
-            .await?;
+        stream.write_pcm_i16(chunk, sample_rate, channels).await?;
 
         // Poll available results so we can estimate streaming latency.
         loop {
@@ -142,7 +146,12 @@ async fn main() -> Result<()> {
 
         if let Some((ref_text, ref_name)) = load_ref_text()? {
             let cer = cer_percent(&ref_text, &transcript);
-            println!("asr_file: cer_percent={:.2} ref={} hyp_len={}", cer, ref_name, transcript.len());
+            println!(
+                "asr_file: cer_percent={:.2} ref={} hyp_len={}",
+                cer,
+                ref_name,
+                transcript.len()
+            );
         }
     }
 
@@ -151,11 +160,15 @@ async fn main() -> Result<()> {
 
 #[cfg(feature = "asr-sherpa")]
 fn read_wav_i16(path: &str) -> Result<(Vec<i16>, u32, u16)> {
-    let mut reader = hound::WavReader::open(path)
-        .with_context(|| format!("failed to open wav: {path}"))?;
+    let mut reader =
+        hound::WavReader::open(path).with_context(|| format!("failed to open wav: {path}"))?;
     let spec = reader.spec();
     if spec.sample_format != hound::SampleFormat::Int || spec.bits_per_sample != 16 {
-        bail!("only 16-bit PCM wav is supported (got {:?}/{})", spec.sample_format, spec.bits_per_sample);
+        bail!(
+            "only 16-bit PCM wav is supported (got {:?}/{})",
+            spec.sample_format,
+            spec.bits_per_sample
+        );
     }
     if spec.channels == 0 {
         bail!("wav channels must be >= 1");
@@ -201,10 +214,42 @@ fn normalize_text(text: &str) -> Vec<char> {
         .filter(|c| {
             !matches!(
                 c,
-                '，' | '。' | '！' | '？' | '；' | '：' | '、' | ',' | '.' | '!' | '?' | ';' | ':'
-                    | '"' | '\'' | '“' | '”' | '‘' | '’' | '(' | ')' | '（' | '）' | '《'
-                    | '》' | '【' | '】' | '[' | ']' | '{' | '}' | '<' | '>' | '…' | '—'
-                    | '-' | '·'
+                '，' | '。'
+                    | '！'
+                    | '？'
+                    | '；'
+                    | '：'
+                    | '、'
+                    | ','
+                    | '.'
+                    | '!'
+                    | '?'
+                    | ';'
+                    | ':'
+                    | '"'
+                    | '\''
+                    | '“'
+                    | '”'
+                    | '‘'
+                    | '’'
+                    | '('
+                    | ')'
+                    | '（'
+                    | '）'
+                    | '《'
+                    | '》'
+                    | '【'
+                    | '】'
+                    | '['
+                    | ']'
+                    | '{'
+                    | '}'
+                    | '<'
+                    | '>'
+                    | '…'
+                    | '—'
+                    | '-'
+                    | '·'
             )
         })
         .collect()
@@ -226,9 +271,7 @@ fn edit_distance(a: &[char], b: &[char]) -> usize {
         curr[0] = i + 1;
         for (j, cb) in b.iter().enumerate() {
             let cost = if ca == cb { 0 } else { 1 };
-            curr[j + 1] = (prev[j + 1] + 1)
-                .min(curr[j] + 1)
-                .min(prev[j] + cost);
+            curr[j + 1] = (prev[j + 1] + 1).min(curr[j] + 1).min(prev[j] + cost);
         }
         prev.copy_from_slice(&curr);
     }

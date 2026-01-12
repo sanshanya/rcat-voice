@@ -21,6 +21,7 @@ hyper-util = { version = "0.1", features = ["tokio"], optional = true }
 http-body-util = { version = "0.1", optional = true }
 cpal = { version = "0.15.3", optional = true }
 smart-turn-rs = { package = "smart-turn-rs", git = "https://github.com/miuda-ai/smart-turn-rs", rev = "92c3fca4d9ef690d142ccaf5193e6469b3517979", optional = true }
+ort = { version = "2.0.0-rc.10", optional = true }
 
 # Optional: GPT-SoVITS (Windows + CUDA) backend
 # Pin to the commit that updates `tch` to support libtorch 2.9.
@@ -38,12 +39,12 @@ smallvec = "1.15.1"
 [features]
 default = []
 gpt-sovits = ["dep:gpt_sovits_rs", "dep:wav_io", "tokenizer-jieba", "audio-rodio"]
-gpt-sovits-onnx = ["dep:gpt_sovits_onnx_rs", "audio-rodio"]
+gpt-sovits-onnx = ["dep:gpt_sovits_onnx_rs", "dep:ort", "audio-rodio"]
 audio-rodio = ["dep:rodio"]
 tokenizer-jieba = ["dep:jieba-rs"]
 asr-sherpa = ["dep:sherpa-rs"]
 asr-mic = ["dep:cpal"]
-turn-smart = ["dep:smart-turn-rs"]
+turn-smart = ["dep:smart-turn-rs", "dep:ort"]
 tts-remote = ["dep:bytes", "dep:futures-util", "dep:reqwest", "dep:serde", "dep:serde_json", "audio-rodio"]
 tts-worker = ["dep:bytes", "dep:futures-util", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:serde", "dep:serde_json", "gpt-sovits"]
 
