@@ -7,7 +7,7 @@
 - 🎤 **流式 ASR** - Sherpa-ONNX (Paraformer/SenseVoice/FunASR)
 - 🔚 **智能端点检测** - Smart Turn v3 ONNX
 - 🗣️ **流式 TTS** - GPT-SoVITS (CUDA/ONNX) / OS TTS / Remote
-- ⚡ **低延迟优化** - LLM Client 复用、模型预热、双门 Barge-in
+- ⚡ **低延迟优化** - LLM Client 复用、模型预热、VAD Barge-in
 - 📊 **可观测性** - 延迟指标、Ring Buffer 监控
 
 ---

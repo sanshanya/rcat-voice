@@ -106,14 +106,13 @@ $env:ASR_MODEL = "funasr-nano-int8"  # 推荐
 
 ## 打断检测 (Barge-in)
 
-检测用户在助手说话时的打断行为。使用双门机制降低误打断。
+检测用户在助手说话时的打断行为：基于 **VAD SpeechStart** 触发计时，达到确认窗口后打断播放/对话。
 
 | 功能 | 别名 | 代码位置 | 配置 |
 |------|------|---------|------|
-| 双门检测 | 打断, 插话 | `voice_assistant.rs:339-380` | - |
-| Gate 1 能量 | 粗门 | `is_silence_chunk()` | `BARGE_IN_SILENCE_ABS` |
-| Gate 2 确认 | 确认窗口 | `consecutive_non_silence_ms` | `BARGE_IN_CONFIRM_MS` |
-| 触发阈值 | 语音时长 | `speech_streak_ms` | `BARGE_IN_MIN_SPEECH_MS` |
+| VAD 打断 | 打断, 插话 | `voice_assistant.rs` | - |
+| 确认窗口 | confirm window | `voice_assistant.rs` | `BARGE_IN_CONFIRM_MS` |
+| 触发阈值 | 语音时长 | `voice_assistant.rs` | `BARGE_IN_MIN_SPEECH_MS` |
 
 ### 常用操作
 

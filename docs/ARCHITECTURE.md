@@ -174,7 +174,7 @@ flowchart TB
 
     subgraph Turn["端点与打断"]
         SMART["SmartTurnDetector<br/>8s窗口, ONNX CPU"]
-        BARGE_DET["Barge-in Detector<br/>双门能量+确认窗口"]
+        BARGE_DET["Barge-in Detector<br/>VAD边沿+确认窗口"]
     end
 
     subgraph VoiceAssistant["voice_assistant"]
