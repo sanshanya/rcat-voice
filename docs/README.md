@@ -9,6 +9,7 @@
 | [ARCHITECTURE.md](./ARCHITECTURE.md) | 系统架构、数据流图、模块依赖 | 开发者、贡献者 |
 | [FEATURE_MAP.md](./FEATURE_MAP.md) | 功能-代码映射，自然语言定位代码 | AI 辅助开发、新贡献者 |
 | [TROUBLESHOOTING.md](./TROUBLESHOOTING.md) | 常见问题、故障排查、调试技巧 | 集成者、运维 |
+| [optimized.md](./optimized.md) | 未实现/待优化事项清单 | 开发者、维护者 |
 
 ## 阅读建议
 

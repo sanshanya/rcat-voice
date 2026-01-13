@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util", "signal", "io-std", "net"] }
+tokio-util = { version = "0.7", features = ["slab"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "tracing-log"] }
 async-trait = "0.1"
@@ -19,7 +20,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 hyper = { version = "1", features = ["server", "http1"], optional = true }
 hyper-util = { version = "0.1", features = ["tokio"], optional = true }
 http-body-util = { version = "0.1", optional = true }
-cpal = { version = "0.15.3", optional = true }
+cpal = { version = "0.17.1", optional = true }
 smart-turn-rs = { package = "smart-turn-rs", git = "https://github.com/miuda-ai/smart-turn-rs", rev = "92c3fca4d9ef690d142ccaf5193e6469b3517979", optional = true }
 ort = { version = "2.0.0-rc.10", optional = true }
 

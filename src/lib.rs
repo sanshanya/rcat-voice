@@ -7,11 +7,12 @@
 //! # async fn main() -> anyhow::Result<()> {
 //! let tts = TtsEngineBuilder::new(TtsBackend::Os).build()?;
 //! let session = StreamSession::builder(tts.clone()).build();
-//! let control = session.control();
-//! control.mark_llm_start();
-//! control.sender().send("Hello,".to_string()).await?;
-//! control.sender().send(" world!".to_string()).await?;
-//! session.shutdown().await?;
+//! let handle = session.control();
+//! handle.mark_llm_start();
+//! handle.push_delta("Hello,".to_string()).await?;
+//! handle.push_delta(" world!".to_string()).await?;
+//! handle.finish_input().await?;
+//! session.finish().await?;
 //! # Ok(())
 //! # }
 //! ```
@@ -51,8 +52,12 @@ pub mod prelude {
         default_sink,
     };
     pub use crate::pipeline::PipelineConfig;
-    pub use crate::streaming::{StreamConfig, StreamControl, StreamSession, StreamSessionBuilder};
-    pub use crate::tokenizer::{Segment, TokenizerConfig};
+    pub use crate::streaming::{
+        StreamConfig, StreamHandle, StreamMsg, StreamSession, StreamSessionBuilder,
+    };
+    #[allow(deprecated)]
+    pub use crate::tokenizer::Segment;
+    pub use crate::tokenizer::{TextSegment, TokenizerConfig};
     #[cfg(feature = "turn-smart")]
     pub use crate::turn::{SmartTurnConfig, SmartTurnDecision, SmartTurnDetector, SmartTurnModel};
 }

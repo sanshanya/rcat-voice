@@ -16,14 +16,14 @@ use futures::StreamExt;
 use rcat_voice::{
     generator,
     metrics::{MetricEvent, MetricEventKind, MetricsSink, TracingMetricsSink},
-    streaming::{StreamCancelHandle, StreamSessionBuilder},
+    streaming::{StreamHandle, StreamSessionBuilder},
 };
 #[cfg(all(feature = "asr-sherpa", feature = "asr-mic"))]
 use std::io::{self, Write};
 #[cfg(all(feature = "asr-sherpa", feature = "asr-mic"))]
 use std::sync::Arc;
 #[cfg(all(feature = "asr-sherpa", feature = "asr-mic"))]
-use tokio::sync::{mpsc, watch};
+use tokio::sync::watch;
 #[cfg(all(feature = "asr-sherpa", feature = "asr-mic"))]
 use tokio::task::JoinHandle;
 
@@ -169,7 +169,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    let sample_rate = config.sample_rate.0;
+    let sample_rate = config.sample_rate;
     let channels = config.channels;
     if sample_rate == 0 || channels == 0 {
         bail!(
@@ -331,9 +331,9 @@ async fn main() -> Result<()> {
                 }
             }
             _ = poll.tick() => {
-                if assistant.as_ref().is_some_and(|running| running.handle.is_finished()) {
+                if assistant.as_ref().is_some_and(|running| running.task.is_finished()) {
                     let finished = assistant.take().expect("assistant");
-                    match finished.handle.await {
+                    match finished.task.await {
                         Ok(Ok(result)) => {
                             if !result.cancelled {
                                 let turn_to_finish_ms = result.turn_end_ts.elapsed().as_millis();
@@ -413,9 +413,9 @@ async fn main() -> Result<()> {
                                 );
                                 running.cancel_requested = true;
                                 let _ = running.cancel_tx.send(true);
-                                let cancel_handle = running.cancel_handle.clone();
+                                let stream_handle = running.stream_handle.clone();
                                 tokio::spawn(async move {
-                                    let _ = cancel_handle.cancel().await;
+                                    let _ = stream_handle.stop().await;
                                 });
                             }
                         }
@@ -497,8 +497,8 @@ struct LlmResult {
 #[cfg(all(feature = "asr-sherpa", feature = "asr-mic"))]
 struct RunningAssistant {
     cancel_tx: watch::Sender<bool>,
-    cancel_handle: StreamCancelHandle,
-    handle: JoinHandle<Result<LlmResult>>,
+    stream_handle: StreamHandle,
+    task: JoinHandle<Result<LlmResult>>,
     cancel_requested: bool,
 }
 
@@ -507,9 +507,9 @@ async fn stop_running(mut running: RunningAssistant) -> Result<()> {
     if !running.cancel_requested {
         running.cancel_requested = true;
         let _ = running.cancel_tx.send(true);
-        let _ = running.cancel_handle.cancel().await;
+        let _ = running.stream_handle.stop().await;
     }
-    let _ = running.handle.await;
+    let _ = running.task.await;
     Ok(())
 }
 
@@ -527,29 +527,26 @@ async fn start_assistant(
         .turn_id(turn_id)
         .metrics_sink(metrics)
         .build();
-    let cancel_handle = session.cancel_handle();
-    let control = session.control();
-    control.mark_llm_start();
-    let delta_tx = control.sender();
-    drop(control);
+    let stream_handle = session.control();
+    stream_handle.mark_llm_start();
 
     let (cancel_tx, cancel_rx) = watch::channel(false);
     print!("ASSISTANT: ");
     io::stdout().flush().ok();
 
     let llm_cancel = cancel_rx.clone();
-    let drain_cancel = cancel_rx.clone();
-    let handle = tokio::spawn(async move {
+    let handle_clone = stream_handle.clone();
+    let task = tokio::spawn(async move {
         let result =
-            stream_chat(client, model, messages, delta_tx, llm_cancel, turn_end_ts).await?;
-        session.finish_or_cancel(drain_cancel).await?;
+            stream_chat(client, model, messages, handle_clone, llm_cancel, turn_end_ts).await?;
+        session.finish_or_cancel().await?;
         Ok(result)
     });
 
     Ok(RunningAssistant {
         cancel_tx,
-        cancel_handle,
-        handle,
+        stream_handle,
+        task,
         cancel_requested: false,
     })
 }
@@ -559,7 +556,7 @@ async fn stream_chat(
     client: Arc<Client<OpenAIConfig>>,
     model: Arc<String>,
     messages: Vec<ChatCompletionRequestMessage>,
-    delta_tx: mpsc::Sender<String>,
+    handle: StreamHandle,
     mut cancel: watch::Receiver<bool>,
     turn_end_ts: tokio::time::Instant,
 ) -> Result<LlmResult> {
@@ -600,7 +597,7 @@ async fn stream_chat(
                                 text.push_str(&content);
                                 print!("{content}");
                                 io::stdout().flush().ok();
-                                if delta_tx.send(content).await.is_err() {
+                                if handle.push_delta(content).await.is_err() {
                                     cancelled = true;
                                     break;
                                 }
@@ -618,6 +615,7 @@ async fn stream_chat(
         }
     }
 
+    let _ = handle.finish_input().await;
     println!();
     Ok(LlmResult {
         text,

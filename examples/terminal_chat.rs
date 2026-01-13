@@ -10,13 +10,13 @@ use async_openai::{
 use futures::StreamExt;
 use rcat_voice::generator;
 use rcat_voice::metrics::{MetricEvent, MetricEventKind, MetricsSink, TracingMetricsSink};
-use rcat_voice::streaming::{StreamControl, StreamSession, StreamSessionBuilder};
+use rcat_voice::streaming::{StreamHandle, StreamSession, StreamSessionBuilder};
 use serde_json::Value;
 use serde_json::json;
 use std::io::{self, Write};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tracing::{error, info};
@@ -24,9 +24,9 @@ use tracing_subscriber::EnvFilter;
 
 struct RunningChat {
     session: StreamSession,
-    control: StreamControl,
+    handle: StreamHandle,
     cancel_tx: watch::Sender<bool>,
-    handle: JoinHandle<Result<()>>,
+    task: JoinHandle<Result<()>>,
 }
 
 #[tokio::main]
@@ -83,26 +83,25 @@ async fn main() -> Result<()> {
             .turn_id(this_turn_id)
             .metrics_sink(metrics.clone())
             .build();
-        let control = session.control();
-        control.mark_llm_start();
+        let handle = session.control();
+        handle.mark_llm_start();
 
         let (cancel_tx, cancel_rx) = watch::channel(false);
-        let delta_tx = control.sender();
 
-        let handle = tokio::spawn(sse_stream_chat(
+        let task = tokio::spawn(sse_stream_chat(
             base_url.clone(),
             api_key.clone(),
             model.clone(),
             vec![json!({"role":"user","content": prompt})],
-            delta_tx,
+            handle.clone(),
             cancel_rx,
         ));
 
         current = Some(RunningChat {
             session,
-            control,
-            cancel_tx,
             handle,
+            cancel_tx,
+            task,
         });
     }
 
@@ -115,9 +114,9 @@ async fn main() -> Result<()> {
 
 async fn stop_running(running: RunningChat) -> Result<()> {
     let _ = running.cancel_tx.send(true);
-    let _ = running.control.cancel().await;
-    let _ = running.handle.await;
-    running.session.shutdown().await?;
+    let _ = running.handle.stop().await;
+    let _ = running.task.await;
+    running.session.finish_or_cancel().await?;
     Ok(())
 }
 
@@ -126,7 +125,7 @@ async fn sse_stream_chat(
     api_key: Arc<String>,
     model: Arc<String>,
     messages_json: Vec<Value>,
-    delta_tx: mpsc::Sender<String>,
+    handle: StreamHandle,
     mut cancel: watch::Receiver<bool>,
 ) -> Result<()> {
     let config = OpenAIConfig::new()
@@ -177,7 +176,7 @@ async fn sse_stream_chat(
                     Some(Ok(response)) => {
                         for choice in response.choices {
                             if let Some(content) = choice.delta.content {
-                                if delta_tx.send(content).await.is_err() {
+                                if handle.push_delta(content).await.is_err() {
                                     return Ok(());
                                 }
                             }
@@ -193,6 +192,7 @@ async fn sse_stream_chat(
         }
     }
 
+    let _ = handle.finish_input().await;
     info!("LLM stream finished.");
     Ok(())
 }

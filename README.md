@@ -22,7 +22,7 @@
 
 ```mermaid
 gantt
-    title 流式 ASR → LLM → Tokenizer → TTS(Serial) → 播放（连续流）
+    title 流式 ASR → LLM → Orchestrator → TTS(Serial) → 播放（连续流）
     dateFormat x
     axisFormat %Lms
 
@@ -38,7 +38,7 @@ gantt
     TTFT 等待               :crit, ttft, 2500, 3000
     Token 流式输出           :llm, 3000, 5500
 
-    section Tokenizer
+    section Orchestrator
     分句缓冲（Eager）        :tok, 3000, 3100
     Segment1 发出（事件）     :seg1, 3100, 3101
     Segment2 发出（事件）     :seg2, 4200, 4201
@@ -81,6 +81,12 @@ cargo run --example voice_assistant --features asr-sherpa,asr-mic,turn-smart --r
 ```
 
 ---
+
+## 可选调优环境变量
+
+- `STREAM_DELTA_CAPACITY`：LLM 输入队列容量（默认 8192）
+- `STREAM_SEGMENT_CAPACITY`：文本分段 backlog 上限（默认 4096）
+- `TTS_PIPELINE_MODE`：`auto | serial | decoupled`（调度模式）
 
 ## 关键性能指标
 

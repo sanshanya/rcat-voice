@@ -1,12 +1,13 @@
 use anyhow::Result;
 use rcat_voice::generator::TtsEngine;
 use rcat_voice::pipeline::{Pipeline, PipelineConfig};
-use rcat_voice::tokenizer::{Segment, Tokenizer, TokenizerConfig};
+use rcat_voice::tokenizer::{DeltaMsg, TextSegment, Tokenizer, TokenizerConfig};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{mpsc, watch};
 use tokio::time::{Duration, Instant, sleep};
+use tokio_util::sync::CancellationToken;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -45,17 +46,21 @@ async fn run_round(
     let llm_start = Arc::new(OnceLock::new());
 
     let (cancel_tx, cancel_rx) = watch::channel(false);
-    let (delta_tx, delta_rx) = mpsc::channel::<String>(8192);
-    let (chunk_tx, chunk_rx) = mpsc::channel::<Segment>(4096);
-    let (buffer_tx, buffer_rx) = watch::channel(0u64);
+    let (llm_delta_tx, llm_delta_rx) = mpsc::channel::<DeltaMsg>(256);
+    let (text_seg_tx, text_seg_rx) = mpsc::channel::<TextSegment>(64);
+    let buffer_engine = tts_engine.clone();
+    let buffer_ms = Arc::new(move || buffer_engine.buffered_ms().unwrap_or(0));
+    let cancel = CancellationToken::new();
     let cancel_tx_ctrlc = cancel_tx.clone();
     let cancel_engine = tts_engine.clone();
     let cancel_flag = cancelled.clone();
+    let cancel_ctrlc = cancel.clone();
     let cancel_handle = tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
             cancel_flag.store(true, Ordering::Release);
             let _ = cancel_tx_ctrlc.send(true);
             let _ = cancel_engine.stop().await;
+            cancel_ctrlc.cancel();
         }
     });
 
@@ -68,50 +73,32 @@ async fn run_round(
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(1500)
             .clamp(100, 30_000);
+        let cancel_auto = cancel.clone();
         Some(tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
             cancel_flag.store(true, Ordering::Release);
             let _ = cancel_tx_auto.send(true);
             let _ = cancel_engine.stop().await;
+            cancel_auto.cancel();
         }))
     } else {
         None
     };
 
-    let buffer_poll_ms = std::env::var("AUDIO_BUFFER_POLL_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(20)
-        .clamp(5, 500);
-    let buffer_engine = tts_engine.clone();
-    let buffer_handle = tokio::spawn(async move {
-        let mut last_ms = None;
-        let mut interval = tokio::time::interval(Duration::from_millis(buffer_poll_ms));
-        loop {
-            interval.tick().await;
-            if buffer_tx.is_closed() {
-                break;
-            }
-            let ms = buffer_engine.buffered_ms().unwrap_or(0);
-            if last_ms != Some(ms) {
-                let _ = buffer_tx.send(ms);
-                last_ms = Some(ms);
-            }
-        }
-    });
-
-    // Task 1: Player (Consumer of Segments)
-    let pipeline = Pipeline::new(chunk_rx, tts_engine.clone(), PipelineConfig::from_env());
+    // Task 1: Player (Consumer of TextSegments)
+    let pipeline = Pipeline::new(text_seg_rx, tts_engine.clone(), PipelineConfig::from_env())
+        .with_cancel_token(cancel.clone());
     let pipeline_handle = tokio::spawn(pipeline.run());
 
-    // Task 2: Tokenizer (Consumer of Deltas, Producer of Segments)
+    // Task 2: Tokenizer (Consumer of Deltas, Producer of TextSegments)
     let tokenizer = Tokenizer::new(
-        delta_rx,
-        chunk_tx,
-        buffer_rx,
+        llm_delta_rx,
+        text_seg_tx,
+        buffer_ms,
         session_start_ts,
         llm_start.clone(),
         round as u64,
+        cancel.clone(),
         TokenizerConfig::from_env(),
     );
     let tokenizer_handle = tokio::spawn(tokenizer.run());
@@ -133,7 +120,7 @@ async fn run_round(
         simulated_text,
         chunk_chars,
         Duration::from_millis(delay_ms),
-        delta_tx.clone(),
+        llm_delta_tx.clone(),
         cancel_rx.clone(),
         llm_start.clone(),
     ));
@@ -145,7 +132,8 @@ async fn run_round(
     }
 
     // Close delta input so tokenizer can drain and exit.
-    drop(delta_tx);
+    let _ = llm_delta_tx.send(DeltaMsg::Eof).await;
+    drop(llm_delta_tx);
 
     // Wait for others to drain if needed, or close app
     // In a real app we might wait for the player queue to drain.
@@ -153,7 +141,6 @@ async fn run_round(
     // If SSE broke, tokenizer will close delta_rx, which closes chunk_tx, which closes chunk_rx, pipeline finishes.
     tokenizer_handle.await?;
     pipeline_handle.await?;
-    let _ = buffer_handle.await;
     tts_engine.stop().await?;
     cancel_handle.abort();
     let _ = cancel_handle.await;
@@ -169,7 +156,7 @@ async fn simulate_stream(
     text: String,
     chunk_chars: usize,
     delay: Duration,
-    delta_tx: mpsc::Sender<String>,
+    llm_delta_tx: mpsc::Sender<DeltaMsg>,
     mut cancel_rx: watch::Receiver<bool>,
     llm_start: Arc<OnceLock<Instant>>,
 ) -> Result<()> {
@@ -180,7 +167,7 @@ async fn simulate_stream(
             break;
         }
         let part: String = chunk.iter().collect();
-        if delta_tx.send(part).await.is_err() {
+        if llm_delta_tx.send(DeltaMsg::Delta(part)).await.is_err() {
             break;
         }
         tokio::select! {

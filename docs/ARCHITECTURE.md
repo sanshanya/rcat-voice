@@ -38,6 +38,10 @@ pub trait TtsEngine: Send + Sync {
 ```
 
 > **`stop_fast()`**: O(1) 同步方法，用于取消路径。调用后立即使所有 `CancelScope.is_cancelled()` 返回 true。
+>
+> **`buffered_ms()`**: 播放域“音频排队时长”的观测值（毫秒）。在当前实现中通常直接透传自
+> `AudioBackend::buffered_ms()`（例如 `RemoteTts`/`GPT-SoVITS`），因此**并不是两套独立的缓冲**；
+> `os` 类后端无法观测时返回 `None`。
 
 #### AudioBackend (音频后端)
 
@@ -59,6 +63,9 @@ pub trait SegmentWriter: Send {
 
 > **Generation Gate**: `begin_segment` 接受 `CancelScope`，writer 内部绑定此 scope。
 > `push()` 使用内部 scope 判断，忽略外部参数，防止旧代际写入新轮次。
+>
+> **`buffered_ms()`**: 输出侧队列水位（毫秒）。以 `rodio` 为例，它基于 ring buffer 当前已入队采样数换算：
+> `queued_samples * 1000 / (sample_rate * channels)`；日志里的 `Audio ring buffer: 60s` 是容量上限，并非实时水位。
 
 > **注意**: ASR 仍是具体实现 (`SherpaAsrStream`)；Turn Detection 已抽象为 `TurnBoundaryDetector` trait，
 > 提供 `VadGateTurnDetector` / `SmartTurnBoundaryDetector` 等实现。
@@ -103,7 +110,8 @@ pub enum MetricEventKind {
 | `AudioFrameRef` | `samples: &[i16], sample_rate, channels, ts`              | 音频帧引用 (零拷贝输入)                        |
 | `TurnDetectorConfig` | `min_silence_ms, commit_ms, force_end_ms, ...`       | 端点检测配置                                   |
 | `TurnContext` | `turn_id, epoch_snapshot, created_at`                      | Turn 快照（绑定事件/指标 + 取消快照）          |
-| `Segment`    | `turn_id, text, llm_start_ts, first_token_ts, last_token_ts, segment_sent_ts` | Tokenizer 输出的句子                           |
+| `TextSegment` | `turn_id, text, llm_start_ts, first_token_ts, last_token_ts, segment_sent_ts` | Orchestrator 内部分句逻辑输出                  |
+| `StreamMsg` | `Delta { text, epoch } / Eof { epoch }`                  | StreamSession 输入消息（带代际）              |
 | `MetricEvent` | `turn_id, kind, ts`                                         | 原子指标事件（用于 MetricsSink）               |
 | `TtsMetrics` | `start_ts, first_audio_ts, gen_done_ts, play_done_ts`        | TTS 时间指标                                   |
 | `RmsPayload` | `rms, peak, buffered_ms, speaking, seq`                      | 唇形同步遥测                                   |
@@ -127,8 +135,7 @@ pub enum MetricEventKind {
 ```mermaid
 flowchart LR
     subgraph Channels["命名约定与类型"]
-        D["delta_tx/rx<br/>mpsc<String><br/>容量: 8192"]
-        C["chunk_tx/rx (文本分段)<br/>mpsc<Segment><br/>容量: 4096"]
+        D["stream_tx/rx<br/>mpsc<StreamMsg><br/>容量: 8192"]
         S["vad_segment_tx/rx (音频分段)<br/>mpsc<VadSegment><br/>容量: 8"]
         A["out_tx/rx<br/>mpsc<AsrSegment><br/>容量: 64"]
         R["rms_tx<br/>mpsc::Unbounded"]
@@ -138,13 +145,13 @@ flowchart LR
 > **命名约定** (避免 segment 歧义):
 >
 > - 音频分段：`vad_segment` / `VadSegment` (代码中仍为 `segment_tx`)
-> - 文本分段：`text_segment` / `Segment` (代码中为 `chunk_tx`)
+> - 文本分段：`text_segment` / `TextSegment` (由 Orchestrator 产出)
 
 ### 背压与丢弃策略
 
 | Channel                   | 满时策略                          | 代码位置             |
 | ------------------------- | --------------------------------- | -------------------- |
-| `delta_tx`              | 阻塞发送端 (背压)                 | `streaming.rs:242` |
+| `stream_tx`             | 阻塞发送端 (背压)                 | `src/streaming.rs` |
 | `segment_tx` (VAD→ASR) | 阻塞发送端 (spawn_blocking 背压) | `src/asr/sherpa.rs` |
 | RingBuffer                | Polling + Backoff Sleep           | `rodio.rs:435`     |
 
@@ -154,7 +161,7 @@ flowchart LR
 
 > **ASR segment 队列策略**: 使用有界队列 + `blocking_send`，不会丢段；队列满时会阻塞 VAD 线程（spawn_blocking），形成背压并避免内存无限增长。
 
-> **上游影响**: `delta_tx` 满时阻塞等价于 "LLM delta 读取链路阻塞"，背压将传回 LLM 响应读取处（可能导致上游缓冲增加）。因此必须配合"取消后立即停止消费 delta"的策略才能闭环。
+> **上游影响**: `stream_tx` 满时阻塞等价于 "LLM delta 读取链路阻塞"，背压将传回 LLM 响应读取处（可能导致上游缓冲增加）。因此必须配合"取消后立即停止消费 delta"的策略才能闭环。
 
 ---
 
@@ -181,12 +188,11 @@ flowchart TB
         TURN_TEXT["turn_text 累积<br/>String"]
         TURN_GATE["Turn Gate<br/>端点决策逻辑"]
         LLM_REQ["LLM 请求<br/>ChatCompletion"]
-        LLM_DELTA["LLM 流式增量<br/>mpsc<String>"]
+        LLM_DELTA["LLM 流式增量<br/>mpsc<StreamMsg>"]
     end
 
     subgraph TTS["语音合成"]
-        TOKENIZER["Tokenizer<br/>分句 (句子级)"]
-        PIPELINE["Pipeline<br/>调度"]
+        ORCH["Orchestrator<br/>分句 + 调度"]
         ENGINE["TtsEngine<br/>句子级合成"]
     end
 
@@ -206,19 +212,18 @@ flowchart TB
     SMART -->|"端点概率"| TURN_GATE
     TURN_TEXT --> TURN_GATE
     TURN_GATE -->|"turn_end"| LLM_REQ
-    LLM_REQ -->|"delta (delta_tx)"| LLM_DELTA
+    LLM_REQ -->|"StreamMsg (stream_tx)"| LLM_DELTA
 
-    BARGE_DET -->|"打断信号 (interrupt_rx)"| PIPELINE
+    BARGE_DET -->|"打断信号 (interrupt)"| ORCH
 
-    LLM_DELTA -->|"delta String"| TOKENIZER
-    TOKENIZER -->|"Segment (chunk_tx)"| PIPELINE
-    PIPELINE --> ENGINE
+    LLM_DELTA -->|"StreamMsg"| ORCH
+    ORCH --> ENGINE
     ENGINE -->|"PCM f32"| RING
     RING --> RODIO
 ```
 
 > **数据流说明**: ASR 输出的 `AsrSegment` 在 `voice_assistant.rs:402-450` 中被累积到 `turn_text` 变量，
-> 端点确认后构建 `ChatCompletionRequestMessage` 发起 LLM 请求，LLM 返回增量通过 `delta_tx` 发送。
+> 端点确认后构建 `ChatCompletionRequestMessage` 发起 LLM 请求，LLM 返回增量通过 `stream_tx` 发送。
 
 ### 数据流说明
 
@@ -226,9 +231,9 @@ flowchart TB
 2. **VAD 分段**: Silero VAD 检测语音段落，产出 `VadSegment`
 3. **分段推理**: ASR 对每个语音段做**整段推理** (非 CTC streaming partial)
 4. **端点检测**: Smart Turn 在**静音期间**推理端点概率，触发 `turn_end`
-5. **打断检测**: 独立于端点检测，基于 Mic RMS 能量+确认窗口触发 Pipeline 中断
-6. **文本分句**: Tokenizer 将 LLM 增量按标点/长度切分为 `Segment`
-7. **句子级合成**: TTS 按 `Segment` 粒度调用引擎（但内部可是流式的）
+5. **打断检测**: 独立于端点检测，基于 Mic RMS 能量+确认窗口触发 Orchestrator 中断
+6. **文本分句**: Orchestrator 内部分句逻辑将 LLM 增量按标点/长度切分为 `TextSegment`
+7. **句子级合成**: Orchestrator 按 `TextSegment` 粒度调用引擎（但内部可是流式的）
 8. **流式播放**: 音频样本边生成边写入 RingBuffer
 
 > **"流式"的精确含义**:
@@ -257,7 +262,7 @@ flowchart TB
 
 ```mermaid
 gantt
-    title 流式 ASR → LLM → Tokenizer → TTS(Serial) → 播放（连续流）
+    title 流式 ASR → LLM → Orchestrator → TTS(Serial) → 播放（连续流）
     dateFormat x
     axisFormat %Lms
 
@@ -273,7 +278,7 @@ gantt
     TTFT 等待               :crit, ttft, 2500, 3000
     Token 流式输出           :llm, 3000, 5500
 
-    section Tokenizer
+    section Orchestrator
     分句缓冲（Eager）        :tok, 3000, 3100
     Segment1 发出（事件）     :seg1, 3100, 3101
     Segment2 发出（事件）     :seg2, 4200, 4201
@@ -292,13 +297,13 @@ gantt
 > **Serial Mode 关键特征**:
 >
 > - **TTS 与播放重叠**: 首个 PCM block 产出并满足 prefill 后立即开始播放，TTS 继续生成
-> - **Prefill 只发生一次**: 建立 `stream_start` 后，后续 Segment 追加进同一连续播放流
+> - **Prefill 只发生一次**: 建立 `stream_start` 后，后续 TextSegment 追加进同一连续播放流
 
 ### B) Parallel/Batch Mode（整句合成后播放）
 
 ```mermaid
 gantt
-    title 流式 ASR → LLM → Tokenizer → TTS(Parallel/Batch) → 播放
+    title 流式 ASR → LLM → Orchestrator → TTS(Parallel/Batch) → 播放
     dateFormat x
     axisFormat %Lms
 
@@ -310,7 +315,7 @@ gantt
     TTFT 等待               :crit, ttft, 2500, 3000
     Token 流式输出           :llm, 3000, 5500
 
-    section Tokenizer
+    section Orchestrator
     分句缓冲（Eager）        :tok, 3000, 3100
     Segment1 发出            :seg1, 3100, 3101
     Segment2 发出            :seg2, 4200, 4201
@@ -330,7 +335,7 @@ gantt
 
 > **Batch Mode 关键特征**:
 >
-> - **整句合成后播放**: 每个 Segment 完整合成后再写入 RingBuffer
+> - **整句合成后播放**: 每个 TextSegment 完整合成后再写入 RingBuffer
 > - **播放尽量连续**: 若 Seg2 在 Seg1 播完前已就绪，则无缝衔接；否则出现 underflow 间隙
 
 > **瓶颈定位**: 两种模式下，**TTFT 等待**（红色）都是首轮延迟的主要来源。
@@ -376,7 +381,7 @@ pub struct CancelScope {
 
 - `CancelToken { epoch }`: 定义了当前活跃的代际。
 - `stop_fast()` 调用 `cancel.cancel()` 使 epoch++，立即使所有 CancelScope 失效。
-- StreamSession 的取消/打断通过 `stop_fast()` + abort task 实现；不再依赖 `watch` 信号。
+- StreamSession 的取消/打断通过 `stop_fast()` + abort orchestrator 实现；不再依赖 `watch` 信号。
 
 ### TurnContext / TurnManager
 
@@ -390,7 +395,7 @@ TurnContext 用于为“单轮对话”绑定 `turn_id`，并携带取消权威�
 ### O(1) 取消路径
 
 ```
-stop_fast()  →  epoch++  →  abort(tokenizer)  →  abort(pipeline)
+stop_fast()  →  epoch++  →  abort(orchestrator)
     ↓                              ↓                     ↓
 所有 CancelScope 失效    receiver drop       上游 send 立即 Err
 ```
@@ -410,7 +415,7 @@ stop_fast()  →  epoch++  →  abort(tokenizer)  →  abort(pipeline)
 1. 检测到连续语音 >= `BARGE_IN_CONFIRM_MS`
 2. 语音持续 >= `BARGE_IN_MIN_SPEECH_MS`
 3. 调用 `stop_fast()` 使 epoch++ (所有 CancelScope 失效)
-4. abort tokenizer + pipeline (上游 send 立即返回 Err)
+4. abort orchestrator (上游 send 立即返回 Err)
 5. AudioBackend.stop() 清空 RingBuffer
 
 ---
@@ -425,7 +430,7 @@ stop_fast()  →  epoch++  →  abort(tokenizer)  →  abort(pipeline)
 | Smart Turn | tokio task + StdMutex | ✅ inflight=1 | 互斥锁保证 |
 | TTS (CUDA) | `spawn_blocking` | ✅ Semaphore | GPT-SoVITS CUDA |
 | TTS (ONNX) | `spawn_blocking` | ✅ Semaphore | GPT-SoVITS ONNX |
-| TTS Pipeline | tokio task | ✅ synth_inflight=1 | 默认 1 |
+| TTS Orchestrator | tokio task | ✅ synth_inflight=1 | 默认 1 |
 | Rodio 播放 | 驱动线程 | - | 从 RingBuffer 拉取 |
 
 > **审计结论**: 所有 compute 组件均满足 inflight=1 约束，无隐式排队风险。
@@ -478,7 +483,7 @@ stop_fast()  →  epoch++  →  abort(tokenizer)  →  abort(pipeline)
 rcat-voice/
 ├── src/
 │   ├── lib.rs           # 入口 + prelude
-│   ├── streaming.rs     # StreamSession (delta→Tokenizer→Pipeline)
+│   ├── streaming.rs     # StreamSession (StreamMsg→Orchestrator)
 │   ├── pipeline.rs      # TTS 调度
 │   ├── tokenizer.rs     # 文本分句
 │   ├── generator/       # TtsEngine 实现

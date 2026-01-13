@@ -71,7 +71,7 @@ impl MicStream {
             stream_config.buffer_size = cpal::BufferSize::Fixed(frames);
         }
 
-        let sample_rate = stream_config.sample_rate.0;
+        let sample_rate = stream_config.sample_rate;
         let channels = stream_config.channels;
         if sample_rate == 0 || channels == 0 {
             bail!(

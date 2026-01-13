@@ -1,5 +1,6 @@
 use std::sync::{Arc, OnceLock};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use tokio::time::Instant;
 
@@ -8,33 +9,35 @@ use crate::metrics::{MetricEvent, MetricEventKind, MetricsSink, default_sink};
 
 const THRESHOLD_MAX_CHARS: usize = 400;
 
+pub type BufferMsFn = Arc<dyn Fn() -> u64 + Send + Sync>;
+
 #[derive(Debug, Clone, Copy)]
-struct FlushThresholds {
-    min_chars: usize,
-    soft_max: usize,
-    hard_max: usize,
+pub(crate) struct FlushThresholds {
+    pub(crate) min_chars: usize,
+    pub(crate) soft_max: usize,
+    pub(crate) hard_max: usize,
 }
 
-const EAGER_DEFAULT: FlushThresholds = FlushThresholds {
+pub(crate) const EAGER_DEFAULT: FlushThresholds = FlushThresholds {
     min_chars: 2,
     soft_max: 6,
     hard_max: 12,
 };
 
-const NORMAL_DEFAULT: FlushThresholds = FlushThresholds {
+pub(crate) const NORMAL_DEFAULT: FlushThresholds = FlushThresholds {
     min_chars: 10,
     soft_max: 20,
     hard_max: 40,
 };
 
-const RELAX_DEFAULT: FlushThresholds = FlushThresholds {
+pub(crate) const RELAX_DEFAULT: FlushThresholds = FlushThresholds {
     min_chars: 20,
     soft_max: 35,
     hard_max: 80,
 };
 
 impl FlushThresholds {
-    fn from_env(prefix: &str, defaults: FlushThresholds) -> Self {
+    pub(crate) fn from_env(prefix: &str, defaults: FlushThresholds) -> Self {
         let (min_chars, soft_max, hard_max) = env::usize_threshold_triplet(
             prefix,
             defaults.min_chars,
@@ -52,7 +55,7 @@ impl FlushThresholds {
 
 #[derive(Debug, Clone)]
 /// 发送到 TTS 管线的文本片段（含时间戳）。
-pub struct Segment {
+pub struct TextSegment {
     /// Turn ID（用于将日志/metrics 与单轮对话绑定）。
     ///
     /// 约定：0 表示“未知/未绑定”。
@@ -67,6 +70,15 @@ pub struct Segment {
     pub last_token_ts: Option<Instant>,
     /// 片段发送到管线的时间戳（t2）。
     pub segment_sent_ts: Instant,
+}
+
+#[deprecated(since = "0.2.0", note = "use TextSegment")]
+pub type Segment = TextSegment;
+
+#[derive(Debug)]
+pub enum DeltaMsg {
+    Delta(String),
+    Eof,
 }
 
 /// Tokenizer tuning parameters.
@@ -110,75 +122,82 @@ impl TokenizerConfig {
 }
 
 pub struct Tokenizer {
-    delta_rx: mpsc::Receiver<String>,
-    chunk_tx: mpsc::Sender<Segment>,
-    buffer_ms_rx: watch::Receiver<u64>,
+    delta_rx: mpsc::Receiver<DeltaMsg>,
+    text_seg_tx: mpsc::Sender<TextSegment>,
+    buffer_ms: BufferMsFn,
     session_start_ts: Instant, // t0 fallback
     llm_start: Arc<OnceLock<Instant>>,
     turn_id: u64,
     metrics: Arc<dyn MetricsSink>,
     config: TokenizerConfig,
+    cancel: CancellationToken,
 }
 
 impl Tokenizer {
     pub fn new(
-        delta_rx: mpsc::Receiver<String>,
-        chunk_tx: mpsc::Sender<Segment>,
-        buffer_ms_rx: watch::Receiver<u64>,
+        delta_rx: mpsc::Receiver<DeltaMsg>,
+        text_seg_tx: mpsc::Sender<TextSegment>,
+        buffer_ms: BufferMsFn,
         session_start_ts: Instant,
         llm_start: Arc<OnceLock<Instant>>,
         turn_id: u64,
+        cancel: CancellationToken,
         config: TokenizerConfig,
     ) -> Self {
         Self {
             delta_rx,
-            chunk_tx,
-            buffer_ms_rx,
+            text_seg_tx,
+            buffer_ms,
             session_start_ts,
             llm_start,
             turn_id,
             metrics: default_sink(),
             config: config.normalize(),
+            cancel,
         }
     }
 
     pub fn new_with_metrics(
-        delta_rx: mpsc::Receiver<String>,
-        chunk_tx: mpsc::Sender<Segment>,
-        buffer_ms_rx: watch::Receiver<u64>,
+        delta_rx: mpsc::Receiver<DeltaMsg>,
+        text_seg_tx: mpsc::Sender<TextSegment>,
+        buffer_ms: BufferMsFn,
         session_start_ts: Instant,
         llm_start: Arc<OnceLock<Instant>>,
         turn_id: u64,
         metrics: Arc<dyn MetricsSink>,
+        cancel: CancellationToken,
         config: TokenizerConfig,
     ) -> Self {
         Self {
             delta_rx,
-            chunk_tx,
-            buffer_ms_rx,
+            text_seg_tx,
+            buffer_ms,
             session_start_ts,
             llm_start,
             turn_id,
             metrics,
             config: config.normalize(),
+            cancel,
         }
     }
 
     pub fn from_env(
-        delta_rx: mpsc::Receiver<String>,
-        chunk_tx: mpsc::Sender<Segment>,
-        buffer_ms_rx: watch::Receiver<u64>,
+        delta_rx: mpsc::Receiver<DeltaMsg>,
+        text_seg_tx: mpsc::Sender<TextSegment>,
+        buffer_ms: BufferMsFn,
         session_start_ts: Instant,
         llm_start: Arc<OnceLock<Instant>>,
         turn_id: u64,
+        cancel: CancellationToken,
     ) -> Self {
         Self::new(
             delta_rx,
-            chunk_tx,
-            buffer_ms_rx,
+            text_seg_tx,
+            buffer_ms,
             session_start_ts,
             llm_start,
             turn_id,
+            cancel,
             TokenizerConfig::from_env(),
         )
     }
@@ -203,7 +222,7 @@ impl Tokenizer {
             .get()
             .copied()
             .unwrap_or(self.session_start_ts);
-        let chunk = Segment {
+        let chunk = TextSegment {
             turn_id: self.turn_id,
             text,
             llm_start_ts,
@@ -212,7 +231,7 @@ impl Tokenizer {
             segment_sent_ts: Instant::now(),
         };
 
-        if self.chunk_tx.send(chunk).await.is_err() {
+        if self.text_seg_tx.send(chunk).await.is_err() {
             return false;
         }
         *first = false;
@@ -229,34 +248,51 @@ impl Tokenizer {
         let mut last_delta_ts: Option<Instant> = None;
         let mut llm_first_token_emitted = false;
         let mut eager_chunks_remaining = self.config.eager_chunks;
+        let mut input_closed = false;
 
         let relax_buffer_ms = self.config.relax_buffer_ms;
         let relax_log = self.config.relax_log;
         let mut relax_active = false;
         'run: loop {
             tokio::select! {
+                _ = self.cancel.cancelled() => {
+                    break 'run;
+                }
                 maybe = self.delta_rx.recv() => {
-                    let is_eof = maybe.is_none();
-                    if let Some(delta) = maybe {
-                        let now = Instant::now();
-
-                        // Capture time of first (non-empty) token.
-                        if first_delta_ts.is_none() && !delta.is_empty() {
-                            first_delta_ts = Some(now);
-                            if !llm_first_token_emitted {
-                                self.metrics.on_event(MetricEvent {
-                                    turn_id: self.turn_id,
-                                    kind: MetricEventKind::LlmFirstToken,
-                                    ts: now,
-                                });
-                                llm_first_token_emitted = true;
+                    let mut is_eof = false;
+                    match maybe {
+                        Some(DeltaMsg::Delta(delta)) => {
+                            if input_closed {
+                                continue;
                             }
-                        }
-                        if !delta.is_empty() {
-                            last_delta_ts = Some(now);
-                        }
+                            let now = Instant::now();
 
-                        buf.push_str(&delta);
+                            // Capture time of first (non-empty) token.
+                            if first_delta_ts.is_none() && !delta.is_empty() {
+                                first_delta_ts = Some(now);
+                                if !llm_first_token_emitted {
+                                    self.metrics.on_event(MetricEvent {
+                                        turn_id: self.turn_id,
+                                        kind: MetricEventKind::LlmFirstToken,
+                                        ts: now,
+                                    });
+                                    llm_first_token_emitted = true;
+                                }
+                            }
+                            if !delta.is_empty() {
+                                last_delta_ts = Some(now);
+                            }
+
+                            buf.push_str(&delta);
+                        }
+                        Some(DeltaMsg::Eof) => {
+                            input_closed = true;
+                            is_eof = true;
+                        }
+                        None => {
+                            input_closed = true;
+                            is_eof = true;
+                        }
                     }
 
                     if is_eof && buf.is_empty() {
@@ -268,7 +304,7 @@ impl Tokenizer {
                         let (thresholds, relax_now) = if eager_chunks_remaining > 0 {
                             (eager_thresholds, false)
                         } else {
-                            let buffered_ms = *self.buffer_ms_rx.borrow();
+                            let buffered_ms = (self.buffer_ms)();
                             buffered_ms_for_log = Some(buffered_ms);
                             let relax_now = relax_buffer_ms > 0 && buffered_ms >= relax_buffer_ms;
                             let thresholds = if relax_now {
@@ -284,8 +320,8 @@ impl Tokenizer {
                             thresholds.hard_max,
                         );
                         if relax_log && relax_now != relax_active {
-                            let buffered_ms = buffered_ms_for_log
-                                .unwrap_or_else(|| *self.buffer_ms_rx.borrow());
+                            let buffered_ms =
+                                buffered_ms_for_log.unwrap_or_else(|| (self.buffer_ms)());
                             log_relax_transition(
                                 relax_now,
                                 &mut relax_active,
@@ -325,7 +361,7 @@ impl Tokenizer {
     }
 }
 
-fn log_relax_transition(
+pub(crate) fn log_relax_transition(
     relax_now: bool,
     relax_active: &mut bool,
     buffered_ms: u64,
@@ -349,7 +385,12 @@ fn log_relax_transition(
     }
 }
 
-fn find_flush_index(s: &str, min_chars: usize, soft_max: usize, hard_max: usize) -> Option<usize> {
+pub(crate) fn find_flush_index(
+    s: &str,
+    min_chars: usize,
+    soft_max: usize,
+    hard_max: usize,
+) -> Option<usize> {
     let scan = scan_boundaries(s, hard_max);
     let count = scan.total_chars;
 
@@ -536,19 +577,21 @@ mod tests {
 
     #[tokio::test]
     async fn tokenizer_flushes_multiple_segments_from_single_delta() {
-        let (delta_tx, delta_rx) = tokio::sync::mpsc::channel::<String>(8);
-        let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::channel::<Segment>(8);
-        let (_buffer_tx, buffer_rx) = tokio::sync::watch::channel(0u64);
+        let (llm_delta_tx, llm_delta_rx) = tokio::sync::mpsc::channel::<DeltaMsg>(8);
+        let (text_seg_tx, mut text_seg_rx) = tokio::sync::mpsc::channel::<TextSegment>(8);
+        let buffer_ms = Arc::new(|| 0u64);
 
         let session_start_ts = Instant::now();
         let llm_start = Arc::new(OnceLock::new());
+        let cancel = CancellationToken::new();
         let tokenizer = Tokenizer::new(
-            delta_rx,
-            chunk_tx,
-            buffer_rx,
+            llm_delta_rx,
+            text_seg_tx,
+            buffer_ms,
             session_start_ts,
             llm_start,
             123,
+            cancel,
             TokenizerConfig {
                 eager_chunks: 0,
                 relax_buffer_ms: 0,
@@ -558,22 +601,26 @@ mod tests {
 
         let handle = tokio::spawn(tokenizer.run());
 
-        delta_tx
-            .send("这是第一句很长很长很长！这是第二句也很长很长很长！这是第三句也很长很长很长！这是第四句也很长很长很长！".to_string())
+        llm_delta_tx
+            .send(DeltaMsg::Delta(
+                "这是第一句很长很长很长！这是第二句也很长很长很长！这是第三句也很长很长很长！这是第四句也很长很长很长！"
+                    .to_string(),
+            ))
             .await
             .unwrap();
 
-        let first = timeout(Duration::from_millis(1000), chunk_rx.recv())
+        let first = timeout(Duration::from_millis(1000), text_seg_rx.recv())
             .await
             .unwrap()
             .unwrap();
-        let second = timeout(Duration::from_millis(1000), chunk_rx.recv())
+        let second = timeout(Duration::from_millis(1000), text_seg_rx.recv())
             .await
             .unwrap()
             .unwrap();
         assert_ne!(first.text, second.text);
 
-        drop(delta_tx);
+        let _ = llm_delta_tx.send(DeltaMsg::Eof).await;
+        drop(llm_delta_tx);
         let _ = handle.await;
     }
 }

@@ -66,7 +66,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    let sample_rate = config.sample_rate.0;
+    let sample_rate = config.sample_rate;
     let channels = config.channels;
     if sample_rate == 0 || channels == 0 {
         bail!(

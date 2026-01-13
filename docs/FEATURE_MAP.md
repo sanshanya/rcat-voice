@@ -130,9 +130,10 @@ $env:BARGE_IN_MIN_SPEECH_MS = "600"   # 增大触发时长
 
 | 功能 | 别名 | 代码位置 | 配置 |
 |------|------|---------|------|
-| 会话管理 | StreamSession | `src/streaming.rs` | - |
-| 控制接口 | StreamControl | `StreamControl` | - |
-| 取消/打断 | interrupt, cancel | `SessionCancel` | - |
+| 会话管理 | StreamSession | `src/streaming.rs` | `STREAM_*` |
+| Orchestrator | 分句 + 调度 | `src/streaming.rs` | `STREAM_*` |
+| 控制接口 | StreamHandle | `StreamHandle` | - |
+| 取消/打断 | stop/interrupt/cancel | `StreamHandle` | - |
 
 ---
 
@@ -142,8 +143,8 @@ $env:BARGE_IN_MIN_SPEECH_MS = "600"   # 增大触发时长
 
 | 功能 | 别名 | 代码位置 | 配置 |
 |------|------|---------|------|
-| 管道调度 | Pipeline | `src/pipeline.rs` | `TTS_PARALLEL_SYNTH` |
-| 并行合成 | run_parallel | `Pipeline.run_parallel()` | `TTS_SYNTH_INFLIGHT` |
+| 管道调度 | Pipeline | `src/pipeline.rs` | `TTS_PIPELINE_MODE` |
+| 并行合成 | Decoupled | `PipelineMode::Decoupled` | `TTS_SYNTH_INFLIGHT` |
 
 ---
 

@@ -10,10 +10,10 @@ use async_openai::{
 use futures::StreamExt;
 use rcat_voice::generator;
 use rcat_voice::metrics::{MetricsSink, TracingMetricsSink};
-use rcat_voice::streaming::StreamSessionBuilder;
+use rcat_voice::streaming::{StreamHandle, StreamSessionBuilder};
 use serde_json::Value;
 use std::sync::Arc;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::watch;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
@@ -35,14 +35,14 @@ async fn main() -> Result<()> {
         .turn_id(turn_id)
         .metrics_sink(metrics)
         .build();
-    let control = session.control();
-    control.mark_llm_start();
+    let handle = session.control();
+    handle.mark_llm_start();
 
     let messages = vec![
         serde_json::json!({"role":"user","content":"请用两三句话解释为什么首段短、后续段长更适合流式TTS。"}),
     ];
     let (cancel_tx, cancel_rx) = watch::channel(false);
-    let cancel_ctrl = control.clone();
+    let cancel_ctrl = handle.clone();
     let cancel_handle = tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
             let _ = cancel_tx.send(true);
@@ -50,9 +50,13 @@ async fn main() -> Result<()> {
         }
     });
 
-    let delta_tx = control.sender();
     let sse_handle = tokio::spawn(sse_stream_chat(
-        base_url, api_key, model, messages, delta_tx, cancel_rx,
+        base_url,
+        api_key,
+        model,
+        messages,
+        handle.clone(),
+        cancel_rx,
     ));
 
     if let Err(e) = sse_handle.await? {
@@ -62,7 +66,7 @@ async fn main() -> Result<()> {
     }
 
     let _ = cancel_handle.await;
-    session.shutdown().await?;
+    session.finish_or_cancel().await?;
     Ok(())
 }
 
@@ -71,7 +75,7 @@ async fn sse_stream_chat(
     api_key: String,
     model: String,
     messages_json: Vec<Value>,
-    delta_tx: mpsc::Sender<String>,
+    handle: StreamHandle,
     mut cancel: watch::Receiver<bool>,
 ) -> Result<()> {
     let config = OpenAIConfig::new()
@@ -122,7 +126,7 @@ async fn sse_stream_chat(
                     Some(Ok(response)) => {
                         for choice in response.choices {
                             if let Some(content) = choice.delta.content {
-                                if delta_tx.send(content).await.is_err() {
+                                if handle.push_delta(content).await.is_err() {
                                     return Ok(());
                                 }
                             }
@@ -138,5 +142,6 @@ async fn sse_stream_chat(
         }
     }
 
+    let _ = handle.finish_input().await;
     Ok(())
 }
