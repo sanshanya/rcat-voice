@@ -10,6 +10,7 @@
 | [FEATURE_MAP.md](./FEATURE_MAP.md) | 功能-代码映射，自然语言定位代码 | AI 辅助开发、新贡献者 |
 | [TROUBLESHOOTING.md](./TROUBLESHOOTING.md) | 常见问题、故障排查、调试技巧 | 集成者、运维 |
 | [optimized.md](./optimized.md) | 未实现/待优化事项清单 | 开发者、维护者 |
+| [optimization_notes.md](./optimization_notes.md) | 2.1/2.2/2.3 优化思路与取舍（方案对比、验证方法） | 开发者、维护者 |
 
 ## 阅读建议
 

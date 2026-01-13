@@ -515,7 +515,7 @@ impl SherpaAsrStream {
         let vad_state_for_struct = vad_state.clone();
 
         let join = tokio::spawn(async move {
-            let (segment_tx, segment_rx) = mpsc::channel::<VadSegment>(segment_queue);
+            let (vad_segment_tx, vad_segment_rx) = mpsc::channel::<VadSegment>(segment_queue);
 
             // VAD processing now runs in spawn_blocking to avoid blocking the reactor
             // P0.5 fix: vad.accept_waveform() is synchronous ONNX inference
@@ -524,7 +524,7 @@ impl SherpaAsrStream {
                 run_vad_loop(
                     vad,
                     vad_input_rx,
-                    segment_tx,
+                    vad_segment_tx,
                     vad_event_tx,
                     vad_state_clone,
                     vad_chunk_samples,
@@ -532,7 +532,7 @@ impl SherpaAsrStream {
             });
 
             let infer_handle = tokio::task::spawn_blocking(move || {
-                run_inference_loop(recognizer, segment_rx, out_tx, metrics);
+                run_inference_loop(recognizer, vad_segment_rx, out_tx, metrics);
             });
 
             // Async task now only forwards messages to VAD thread (non-blocking)
@@ -707,7 +707,7 @@ struct VadSegment {
 fn run_vad_loop(
     mut vad: SileroVad,
     vad_rx: std::sync::mpsc::Receiver<VadInputMsg>,
-    segment_tx: mpsc::Sender<VadSegment>,
+    vad_segment_tx: mpsc::Sender<VadSegment>,
     vad_event_tx: mpsc::Sender<VadEvent>,
     vad_state: Arc<RwLock<VadState>>,
     vad_chunk_samples: usize,
@@ -766,14 +766,14 @@ fn run_vad_loop(
                         speech_start_ts = None;
                     }
 
-                    if enqueue_vad_segments_blocking(&mut vad, &segment_tx) {
+                    if enqueue_vad_segments_blocking(&mut vad, &vad_segment_tx) {
                         return;
                     }
                 }
             }
             VadInputMsg::End => {
                 vad.flush();
-                let _ = enqueue_vad_segments_blocking(&mut vad, &segment_tx);
+                let _ = enqueue_vad_segments_blocking(&mut vad, &vad_segment_tx);
 
                 // Emit final SpeechEnd if still speaking
                 if was_speaking {
@@ -806,7 +806,7 @@ fn run_vad_loop(
 /// the receiver is ready, so we don't need to track dropped segments.
 fn enqueue_vad_segments_blocking(
     vad: &mut SileroVad,
-    segment_tx: &mpsc::Sender<VadSegment>,
+    vad_segment_tx: &mpsc::Sender<VadSegment>,
 ) -> bool {
     while !vad.is_empty() {
         let segment = vad.front();
@@ -827,7 +827,7 @@ fn enqueue_vad_segments_blocking(
 
         // Use blocking_send since we're in spawn_blocking context.
         // This will block until receiver is ready, providing natural backpressure.
-        if segment_tx.blocking_send(segment).is_err() {
+        if vad_segment_tx.blocking_send(segment).is_err() {
             // Channel closed, stop processing
             return true;
         }
@@ -837,12 +837,12 @@ fn enqueue_vad_segments_blocking(
 
 fn run_inference_loop(
     mut recognizer: SherpaRecognizer,
-    mut segment_rx: mpsc::Receiver<VadSegment>,
+    mut vad_segment_rx: mpsc::Receiver<VadSegment>,
     out_tx: mpsc::Sender<AsrSegment>,
     metrics: Arc<dyn MetricsSink>,
 ) {
     let mut idx: usize = 0;
-    while let Some(segment) = segment_rx.blocking_recv() {
+    while let Some(segment) = vad_segment_rx.blocking_recv() {
         let infer_start = Instant::now();
         let text = recognizer.transcribe(TARGET_SAMPLE_RATE, &segment.samples);
         let infer_ms = infer_start.elapsed().as_millis() as u64;

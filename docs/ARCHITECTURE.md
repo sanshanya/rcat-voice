@@ -34,6 +34,7 @@ pub trait TtsEngine: Send + Sync {
     async fn synthesize(&self, text: &str) -> Result<Option<SynthesizedAudio>>;
     async fn play_samples(&self, audio: SynthesizedAudio) -> Result<Option<TtsMetrics>>;
     fn buffered_ms(&self) -> Option<u64>;                      // 缓冲水位
+    fn cancel_token(&self) -> Option<CancelToken>;             // 可选：取消权威
 }
 ```
 
@@ -42,6 +43,9 @@ pub trait TtsEngine: Send + Sync {
 > **`buffered_ms()`**: 播放域“音频排队时长”的观测值（毫秒）。在当前实现中通常直接透传自
 > `AudioBackend::buffered_ms()`（例如 `RemoteTts`/`GPT-SoVITS`），因此**并不是两套独立的缓冲**；
 > `os` 类后端无法观测时返回 `None`。
+>
+> **`cancel_token()`**: 返回该引擎使用的取消权威（若可用）。用于将 `TurnContext/TurnManager` 的 epoch 与
+> `stop_fast()` 的代际推进绑定到同一个来源，确保 generation gate 与 turn 语义一致。
 
 #### AudioBackend (音频后端)
 
@@ -144,7 +148,7 @@ flowchart LR
 
 > **命名约定** (避免 segment 歧义):
 >
-> - 音频分段：`vad_segment` / `VadSegment` (代码中仍为 `segment_tx`)
+> - 音频分段：`vad_segment` / `VadSegment`
 > - 文本分段：`text_segment` / `TextSegment` (由 Orchestrator 产出)
 
 ### 背压与丢弃策略
@@ -152,7 +156,7 @@ flowchart LR
 | Channel                   | 满时策略                          | 代码位置             |
 | ------------------------- | --------------------------------- | -------------------- |
 | `stream_tx`             | 阻塞发送端 (背压)                 | `src/streaming.rs` |
-| `segment_tx` (VAD→ASR) | 阻塞发送端 (spawn_blocking 背压) | `src/asr/sherpa.rs` |
+| `vad_segment_tx` (VAD→ASR) | 阻塞发送端 (spawn_blocking 背压) | `src/asr/sherpa.rs` |
 | RingBuffer                | Polling + Backoff Sleep           | `rodio.rs:435`     |
 
 > **RingBuffer 策略**:
@@ -203,10 +207,10 @@ flowchart TB
 
     MIC -->|"PCM i16"| SHERPA
     MIC -->|"PCM i16"| SMART
-    MIC -->|"PCM i16 (RMS)"| BARGE_DET
 
     SHERPA --> VAD
-    VAD -->|"VadSegment (segment_tx)"| ASR_SEG
+    VAD -->|"VadSegment (vad_segment_tx)"| ASR_SEG
+    VAD -->|"VadEvent (SpeechStart/End)"| BARGE_DET
     ASR_SEG -->|"AsrSegment (out_tx)"| TURN_TEXT
 
     SMART -->|"端点概率"| TURN_GATE
@@ -231,7 +235,7 @@ flowchart TB
 2. **VAD 分段**: Silero VAD 检测语音段落，产出 `VadSegment`
 3. **分段推理**: ASR 对每个语音段做**整段推理** (非 CTC streaming partial)
 4. **端点检测**: Smart Turn 在**静音期间**推理端点概率，触发 `turn_end`
-5. **打断检测**: 独立于端点检测，基于 Mic RMS 能量+确认窗口触发 Orchestrator 中断
+5. **打断检测**: 独立于端点检测，示例中基于 ASR/VAD 的 `VadEvent::SpeechStart` + 确认窗口触发 Orchestrator 中断
 6. **文本分句**: Orchestrator 内部分句逻辑将 LLM 增量按标点/长度切分为 `TextSegment`
 7. **句子级合成**: Orchestrator 按 `TextSegment` 粒度调用引擎（但内部可是流式的）
 8. **流式播放**: 音频样本边生成边写入 RingBuffer
@@ -241,14 +245,14 @@ flowchart TB
 > - ASR: 喂入流式 + 分段推理
 > - LLM: Token 流式
 > - TTS: **取决于模式**
->   - **Serial Mode (默认)**: 真正的 **Sample Streaming**。模型每生成一个 PCM Frame (约 20-50ms) 立即写入 RingBuffer，实现"边合成边播放"。
->   - **Parallel Mode**: **Batch Synthesis**。后台线程整句合成完整 PCM (`SynthesizedAudio`)，随后分发播放。
->   - *注: 当前 `gpt-sovits` 后端默认运行在 Serial Mode，支持真流式。*
+>   - **Serial Mode**: `engine.speak()`（合成与播放耦合）。是否“真流式边生成边播”取决于具体后端实现。
+>   - **Decoupled Mode**: `synthesize() → play_samples()`（合成与播放解耦）。通常是“整句/整段先合成完再播放”，TTFA 可能更高，但可用保序调度实现“后台合成 + 前台播放”并行。
+>   - **Auto Mode (默认)**: 若 `engine.supports_synthesis_queue()` 为 true 则走 Decoupled，否则走 Serial。
 >
 > **最小可听单元**:
 >
-> - Serial Mode: 首个 **PCM Block** (几十毫秒量级) 是最小单元。
-> - Parallel Mode: **整句** 是最小单元。
+> - Serial Mode: 取决于后端（可能是首个 PCM block，也可能是整句）。
+> - Decoupled Mode: **整段/整句**（`SynthesizedAudio`）是最小单元。
 >
 > *TTS TTFA 优化在 Serial Mode 下受首个 PCM Block 生成速度决定。*
 
@@ -424,10 +428,10 @@ stop_fast()  →  epoch++  →  abort(orchestrator)
 
 | 组件 | 执行方式 | inflight 约束 | 说明 |
 |----------|---------|--------------|------|
-| Mic 捕获 | cpal 回调线程 → mpsc → tokio | - | 专用线程 |
-| VAD 推理 | `spawn_blocking` + std::sync::mpsc | ✅ inflight=1 | 同步通道保证 |
+| Mic 捕获 | cpal 回调线程 → ArrayQueue → tokio poll | - | 回调线程写入 `crossbeam_queue::ArrayQueue`，消费端轮询取样 |
+| VAD 推理 | tokio → std::sync::mpsc → `spawn_blocking` | ✅ inflight=1 | 同步通道保证 |
 | ASR 推理 | blocking loop | ✅ inflight=1 | 专用线程消费 segment 队列 |
-| Smart Turn | tokio task + StdMutex | ✅ inflight=1 | 互斥锁保证 |
+| Smart Turn | tokio task + spawn_blocking + StdMutex | ✅ inflight=1 | 推理在 blocking 线程池执行；predictor 用互斥锁串行化 |
 | TTS (CUDA) | `spawn_blocking` | ✅ Semaphore | GPT-SoVITS CUDA |
 | TTS (ONNX) | `spawn_blocking` | ✅ Semaphore | GPT-SoVITS ONNX |
 | TTS Orchestrator | tokio task | ✅ synth_inflight=1 | 默认 1 |

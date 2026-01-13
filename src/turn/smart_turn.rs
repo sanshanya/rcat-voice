@@ -2,6 +2,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::mpsc;
 
 use crate::asr::utils::{LinearResampler, pcm_i16_to_mono_f32};
 use crate::internal::{env, models, ort_log};
@@ -427,10 +428,16 @@ pub struct SmartTurnBoundaryDetector {
     endpoint_armed: bool,
     /// 是否已提交
     committed: bool,
+
+    eval_generation: u64,
+    eval_inflight: bool,
+    eval_tx: mpsc::Sender<SmartTurnEvalResult>,
+    eval_rx: mpsc::Receiver<SmartTurnEvalResult>,
 }
 
 impl SmartTurnBoundaryDetector {
     pub fn new(detector: SmartTurnDetector, config: TurnDetectorConfig) -> Self {
+        let (eval_tx, eval_rx) = mpsc::channel();
         Self {
             detector,
             config,
@@ -439,6 +446,10 @@ impl SmartTurnBoundaryDetector {
             last_eval_ts: None,
             endpoint_armed: false,
             committed: false,
+            eval_generation: 0,
+            eval_inflight: false,
+            eval_tx,
+            eval_rx,
         }
     }
 
@@ -485,6 +496,28 @@ impl SmartTurnBoundaryDetector {
             })
             .unwrap_or(true)
     }
+
+    fn drain_eval_results(&mut self) {
+        while let Ok(result) = self.eval_rx.try_recv() {
+            if result.generation != self.eval_generation {
+                continue;
+            }
+            self.eval_inflight = false;
+
+            if self.committed || self.speaking || self.silence_start_ts.is_none() {
+                continue;
+            }
+
+            match result.decision {
+                Ok(decision) => {
+                    self.endpoint_armed = decision.endpoint;
+                }
+                Err(err) => {
+                    tracing::debug!("SmartTurn inference failed: {err}");
+                }
+            }
+        }
+    }
 }
 
 impl TurnBoundaryDetector for SmartTurnBoundaryDetector {
@@ -523,6 +556,7 @@ impl TurnBoundaryDetector for SmartTurnBoundaryDetector {
     }
 
     fn tick(&mut self, now: Instant, out: &mut SmallVec<[TurnEvent; 4]>) {
+        self.drain_eval_results();
         if self.committed {
             return;
         }
@@ -549,9 +583,31 @@ impl TurnBoundaryDetector for SmartTurnBoundaryDetector {
         if self.should_eval(now) && !self.endpoint_armed {
             self.last_eval_ts = Some(now);
 
-            // 同步调用 Smart Turn 推理（注意：这是阻塞操作）
-            if let Ok(decision) = self.detector.predict_endpoint() {
-                self.endpoint_armed = decision.endpoint;
+            if !self.eval_inflight {
+                let audio = self.detector.snapshot_audio();
+                let model = self.detector.model();
+                let threshold = self.detector.threshold();
+                let tx = self.eval_tx.clone();
+                let generation = self.eval_generation;
+
+                match tokio::runtime::Handle::try_current() {
+                    Ok(handle) => {
+                        self.eval_inflight = true;
+                        handle.spawn_blocking(move || {
+                            let decision = model.predict_probability(&audio).map(|p| SmartTurnDecision {
+                                probability: p,
+                                endpoint: p >= threshold,
+                            });
+                            let _ = tx.send(SmartTurnEvalResult { generation, decision });
+                        });
+                    }
+                    Err(_) => {
+                        // No Tokio runtime in context: fall back to synchronous inference.
+                        if let Ok(decision) = self.detector.predict_endpoint() {
+                            self.endpoint_armed = decision.endpoint;
+                        }
+                    }
+                }
             }
         }
 
@@ -569,6 +625,9 @@ impl TurnBoundaryDetector for SmartTurnBoundaryDetector {
     }
 
     fn reset(&mut self) {
+        self.eval_generation = self.eval_generation.wrapping_add(1);
+        self.eval_inflight = false;
+        while self.eval_rx.try_recv().is_ok() {}
         self.detector.reset();
         self.speaking = false;
         self.silence_start_ts = None;
@@ -583,4 +642,9 @@ impl SmartTurnBoundaryDetector {
     pub fn config(&self) -> &TurnDetectorConfig {
         &self.config
     }
+}
+
+struct SmartTurnEvalResult {
+    generation: u64,
+    decision: Result<SmartTurnDecision>,
 }

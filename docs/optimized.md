@@ -45,6 +45,7 @@
 - 现状：`SmartTurnBoundaryDetector.tick()` 内同步调用端点推理（注释也标注为“阻塞操作”），目前依赖调用方的任务模型承载（`src/turn/smart_turn.rs`）
 - 风险：若 tick 被高频调用且运行在核心异步线程上，可能造成 runtime 抖动
 - 方向：将推理迁移到 `spawn_blocking`/专用线程 + 队列；同时保持 `frame.ts` 驱动的确定性语义
+- 当前状态：✅ 已完成（tick 内改为后台推理：优先 `tokio::runtime::Handle::spawn_blocking`，无 runtime 时回退同步推理；结果通过内部 channel 回传并在 reset 时用 generation 丢弃过期结果）
 
 ### 2.5 Pipeline 串行/并行调度器重复（技术债）
 
@@ -80,39 +81,39 @@
 
 ---
 
-## 3) 文档与实现不一致（待同步）
+## 3) 文档与实现不一致（已同步）
 
 ### 3.1 Mic 捕获链路
 
-- 文档描述为 “cpal 回调线程 → mpsc → tokio”
 - 现实现为 cpal 回调写入 `crossbeam_queue::ArrayQueue`（`src/audio/mic.rs`），消费端轮询取样（examples 里也复刻了该模式）
+- 当前状态：✅ 已同步到 `docs/ARCHITECTURE.md`
 
 ### 3.2 VAD 输入通道类型
 
-- 文档描述为 “`spawn_blocking` + std::sync::mpsc”
-- 现实现：VAD 输入确实是 `std::sync::mpsc::channel`，但 Mic→VAD 并非 mpsc；建议在文档中明确“Mic 与 VAD 的边界通道类型”
+- 现实现：VAD 输入确实是 `std::sync::mpsc::channel`，Mic 捕获则是 ArrayQueue；Tokio 侧仅负责转发到 blocking 线程
+- 当前状态：✅ 已同步到 `docs/ARCHITECTURE.md`（tokio → std::sync::mpsc → `spawn_blocking`）
 
 ### 3.3 Barge-in（打断）输入信号来源
 
-- 架构图标注 “Mic PCM i16 (RMS) → Barge-in Detector”
-- 现实现：example 中 barge-in 基于 ASR 侧 `VadEvent::SpeechStart/SpeechEnd` 做确认窗口计时（`examples/voice_assistant.rs`）
+- 现实现：example 中 barge-in 基于 ASR/VAD 侧 `VadEvent::SpeechStart/SpeechEnd` 做确认窗口计时（`examples/voice_assistant.rs`）
+- 当前状态：✅ 已同步到 `docs/ARCHITECTURE.md`
 
 ### 3.4 `TtsEngine` trait 展示不完整
 
 - 实现中额外提供 `cancel_token()`，用于将 TurnContext/TurnManager 与 TTS 的 epoch 绑定到同一来源（`src/generator/mod.rs`、`src/turn/context.rs`）
-- ARCHITECTURE.md 的 trait 片段目前未体现该方法
+- 当前状态：✅ 已同步到 `docs/ARCHITECTURE.md`
 
 ### 3.5 Pipeline 并行合成的生效条件
 
-- Pipeline 的并行合成/信号量主要用于 `parallel_synth && engine.supports_synthesis_queue()`（`src/pipeline.rs`）
-- 现有主要引擎返回 `supports_synthesis_queue=false`，默认路径仍以串行 `speak()` 为主；建议在文档中更明确这一点
+- Pipeline 是否走解耦（`synthesize→play_samples`）取决于 `mode` 与 `engine.supports_synthesis_queue()`（`src/pipeline.rs`）
+- 当前状态：✅ 已同步到 `docs/ARCHITECTURE.md`（Auto/Serial/Decoupled 语义）
 
 ### 3.6 Channel/变量命名约定（segment 歧义）
 
-- 现状：音频分段在类型层面已统一为 `VadSegment`，但代码里很多地方仍使用 `segment_tx/segment_rx` 命名；文本分段类型为 `Segment`，但通道命名仍为 `chunk_tx/chunk_rx`
+- 现状：历史上 `segment`/`chunk` 在不同模块里含义不一（音频段 vs 文本段），容易造成阅读与评审歧义
 - 影响：在讨论“segment”时容易混淆（音频 segment vs 文本 segment），增加 review/维护成本
 - 方向：逐步将命名收敛到 `vad_segment_*`（音频）与 `text_segment_*`（文本）；或在文档中明确“历史命名”并给出对照表
-- 当前状态：✅ 文本分段已收敛为 `TextSegment` + `text_seg_*`/`stream_tx`；⏳ 音频 `vad_segment_*` 命名仍保留历史 `segment_tx`
+- 当前状态：✅ 已完成（文本分段：`TextSegment`；VAD 音频分段通道：`vad_segment_tx/vad_segment_rx`）
 
 ---
 
